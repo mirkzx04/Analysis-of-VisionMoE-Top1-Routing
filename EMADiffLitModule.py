@@ -34,8 +34,6 @@ class EMADiffLitModule(pl.LightningModule):
                 temp_mid,
                 temp_final,
                 temp_epochs,
-                covarage_init,
-                covarage_final,
             ):
 
         """
@@ -69,9 +67,6 @@ class EMADiffLitModule(pl.LightningModule):
         self.temp_final = temp_final
         self.temp_epochs = temp_epochs
         self.num_classes = num_classes
-
-        self.covarage_init = covarage_init
-        self.covarage_final = covarage_final
 
         self.router_mul = 2.0
         self.warmup_backbone = 15
@@ -117,9 +112,7 @@ class EMADiffLitModule(pl.LightningModule):
         self.cutmix_alpha     = 1.0
         self.cutmix_prob      = 0.3
 
-        self.div_loss_weight = 0.0
         self.z_loss_weigth = 0.0
-        self.cov_loss_weight = 0.0
         self.overlap_loss_weight = 0.0
         self.balance_loss_weights = 0.0
 
@@ -171,7 +164,7 @@ class EMADiffLitModule(pl.LightningModule):
                 # Mixup
                 data, targets_a, targets_b, lam = self._mixup_batch(data, labels)
 
-            logits, overlap_loss, balance_loss, z_loss, div_loss = self(data)
+            logits, balance_loss, overlap_loss, z_loss,   = self(data)
 
             # Loss = lam * CE(logits, y_a) + (1-lam) * CE(logits, y_b)
             class_loss = (
@@ -180,14 +173,13 @@ class EMADiffLitModule(pl.LightningModule):
             )
 
         else:
-            logits, overlap_loss, balance_loss, z_loss, div_loss = self(data)
+            logits, balance_loss, overlap_loss,  z_loss,   = self(data)
             class_loss = self.train_loss(logits, labels)
 
         aux_loss = (
             (overlap_loss * self.overlap_loss_weight)
             + (balance_loss * self.balance_loss_weights)
             + (z_loss * self.z_loss_weigth)
-            + (self.div_loss_weight * div_loss)
         )
         total_loss = class_loss + aux_loss
 
@@ -253,9 +245,9 @@ class EMADiffLitModule(pl.LightningModule):
         elif e >= self.router_start_epoch:
             self._unfreeze_router()
             self.z_loss_weigth = 5e-4
-            self.div_loss_weight = 0.0
-            self.overlap_loss_weight = 5e-2
-            self.balance_loss_weights = 0.03
+              
+            self.overlap_loss_weight = 5e-3
+            self.balance_loss_weights = 1e-3
 
             self.model.router.router_temp = self.temp_scheduler()
             self.model.router.noise_std = self.noise_scheduler()
@@ -374,7 +366,7 @@ class EMADiffLitModule(pl.LightningModule):
         data, labels = batch
         data, labels = data.to(self.device), labels.to(self.device)
 
-        logits, overlap_loss, balance_loss, z_loss, div_loss = self(data)
+        logits, balance_loss, overlap_loss, z_loss,   = self(data)
 
         class_loss = self.val_loss(logits, labels)
 
@@ -382,7 +374,6 @@ class EMADiffLitModule(pl.LightningModule):
             (overlap_loss * self.overlap_loss_weight)
             + (balance_loss * self.balance_loss_weights)
             + (z_loss * self.z_loss_weigth)
-            + (self.div_loss_weight * div_loss)
         )
         total_loss = class_loss + aux_loss
 
@@ -444,12 +435,9 @@ class EMADiffLitModule(pl.LightningModule):
         self.log_dict(log_dict, prog_bar=True, logger=True, on_step=False, on_epoch=True)
 
     def _collect_router_metrics(self, prefix: str):
-        include_detail_metrics = (
-            (int(self.current_epoch) + 1) % self.router_detail_metrics_interval == 0
-        )
         with torch.no_grad():
             router_metrics = self.model.moe_aggregator.finalize(
-                include_layer_detail_metrics=include_detail_metrics
+                include_layer_detail_metrics=False
             )
 
         log_dict = {}

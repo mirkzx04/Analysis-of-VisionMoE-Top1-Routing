@@ -28,6 +28,9 @@ class MoEAggregator:
         self.assignment_sum_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
         self.rel_delta_sum_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
         self.rel_delta_count_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
+        self.expert_effective_rel_delta_sum_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
+        self.expert_effective_rel_delta_count_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
+
         self.owner_non_owner_mass_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
         self.owner_total_mass_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
         self.owned_mass_layers = [
@@ -36,8 +39,6 @@ class MoEAggregator:
 
         # Per-layer dense branch scale counters.
         self.dense_rel_delta_sum_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
-        self.post_res_frac_sum_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
-        self.final_rel_delta_sum_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
         self.dense_metric_count_layers = [torch.zeros(1, dtype=torch.float64) for _ in range(num_layers)]
 
         # Per-layer sharpness counters.
@@ -86,25 +87,14 @@ class MoEAggregator:
         self.assignment_sum_layers = [t.to(device=device) for t in self.assignment_sum_layers]
         self.rel_delta_sum_layers = [t.to(device=device) for t in self.rel_delta_sum_layers]
         self.rel_delta_count_layers = [t.to(device=device) for t in self.rel_delta_count_layers]
-        self.owner_non_owner_mass_layers = [
-            t.to(device=device) for t in self.owner_non_owner_mass_layers
-        ]
-        self.owner_total_mass_layers = [
-            t.to(device=device) for t in self.owner_total_mass_layers
-        ]
+        self.expert_effective_rel_delta_sum_layers = [t.to(device=device) for t in self.expert_effective_rel_delta_sum_layers]
+        self.expert_effective_rel_delta_count_layers = [t.to(device=device) for t in self.expert_effective_rel_delta_count_layers]
+        self.owner_non_owner_mass_layers = [t.to(device=device) for t in self.owner_non_owner_mass_layers]
+        self.owner_total_mass_layers = [t.to(device=device) for t in self.owner_total_mass_layers]
         self.owned_mass_layers = [t.to(device=device) for t in self.owned_mass_layers]
-        self.dense_rel_delta_sum_layers = [
-            t.to(device=device) for t in self.dense_rel_delta_sum_layers
-        ]
-        self.post_res_frac_sum_layers = [
-            t.to(device=device) for t in self.post_res_frac_sum_layers
-        ]
-        self.final_rel_delta_sum_layers = [
-            t.to(device=device) for t in self.final_rel_delta_sum_layers
-        ]
-        self.dense_metric_count_layers = [
-            t.to(device=device) for t in self.dense_metric_count_layers
-        ]
+        self.dense_rel_delta_sum_layers = [t.to(device=device) for t in self.dense_rel_delta_sum_layers]
+
+        self.dense_metric_count_layers = [t.to(device=device) for t in self.dense_metric_count_layers]
         self._device = device
 
     @torch.no_grad()
@@ -120,6 +110,8 @@ class MoEAggregator:
         weights: torch.Tensor | None = None,
         rel_delta_sum: float | None = None,
         rel_delta_count: int = 0,
+        expert_effective_rel_delta_sum: float | None = None,
+        expert_effective_rel_delta_count: int = 0,
     ):
         """
         Update accumulators for a single MoE layer on the current batch.
@@ -188,6 +180,10 @@ class MoEAggregator:
             self.rel_delta_sum_layers[layer_idx].add_(float(rel_delta_sum))
             self.rel_delta_count_layers[layer_idx].add_(float(rel_delta_count))
 
+        if expert_effective_rel_delta_sum is not None and expert_effective_rel_delta_count > 0:
+            self.expert_effective_rel_delta_sum_layers[layer_idx].add_(float(expert_effective_rel_delta_sum))
+            self.expert_effective_rel_delta_count_layers[layer_idx].add_(float(expert_effective_rel_delta_count))
+
         if expert_idx is not None and weights is not None and token_idx.numel() > 0:
             E = int(self.num_experts[layer_idx])
             token_idx_owner = token_idx.to(device=device, dtype=torch.long)
@@ -227,8 +223,6 @@ class MoEAggregator:
         self,
         layer_idx: int,
         dense_rel_delta: float,
-        post_res_frac: float,
-        final_rel_delta: float,
         device: torch.device,
     ):
         """
@@ -242,8 +236,6 @@ class MoEAggregator:
         self._ensure_device(device)
 
         self.dense_rel_delta_sum_layers[layer_idx].add_(float(dense_rel_delta))
-        self.post_res_frac_sum_layers[layer_idx].add_(float(post_res_frac))
-        self.final_rel_delta_sum_layers[layer_idx].add_(float(final_rel_delta))
         self.dense_metric_count_layers[layer_idx].add_(1.0)
 
     @torch.no_grad()
@@ -258,12 +250,12 @@ class MoEAggregator:
             *self.assignment_sum_layers,
             *self.rel_delta_sum_layers,
             *self.rel_delta_count_layers,
+            *self.expert_effective_rel_delta_sum_layers,
+            *self.expert_effective_rel_delta_count_layers,
             *self.owner_non_owner_mass_layers,
             *self.owner_total_mass_layers,
             *self.owned_mass_layers,
             *self.dense_rel_delta_sum_layers,
-            *self.post_res_frac_sum_layers,
-            *self.final_rel_delta_sum_layers,
             *self.dense_metric_count_layers,
         ]:
             self._ddp_allreduce_(t)
@@ -275,12 +267,12 @@ class MoEAggregator:
         logits_std_layers = []
         logits_temp_std_layers = []
         token_logit_entropy_layers = []
-        mean_rel_delta_layers = []
         non_owner_mass_frac_layers = []
         owner_entropy_norm_layers = []
+        expert_raw_rel_delta_layers = []
+        expert_effective_rel_delta_layers = []
         dense_rel_delta_layers = []
-        post_res_frac_layers = []
-        final_rel_delta_layers = []
+        dense_to_expert_ratio_layers = []
 
         total_tokens = 0.0
         total_processed = 0.0
@@ -292,6 +284,8 @@ class MoEAggregator:
             assignment_sum = float(self.assignment_sum_layers[layer_idx].item())
             rel_delta_sum = float(self.rel_delta_sum_layers[layer_idx].item())
             rel_delta_count = float(self.rel_delta_count_layers[layer_idx].item())
+            expert_effective_rel_delta_sum = float(self.expert_effective_rel_delta_sum_layers[layer_idx].item())
+            expert_effective_rel_delta_count = float(self.expert_effective_rel_delta_count_layers[layer_idx].item())
             owner_non_owner_mass = float(self.owner_non_owner_mass_layers[layer_idx].item())
             owner_total_mass = float(self.owner_total_mass_layers[layer_idx].item())
             dense_metric_count = float(self.dense_metric_count_layers[layer_idx].item())
@@ -334,9 +328,19 @@ class MoEAggregator:
                 token_logit_entropy_layers.append(0.0)
 
             if rel_delta_count > 0.0:
-                mean_rel_delta_layers.append(rel_delta_sum / rel_delta_count)
+                expert_raw_rel_delta = rel_delta_sum / rel_delta_count
             else:
-                mean_rel_delta_layers.append(0.0)
+                expert_raw_rel_delta = 0.0
+
+            if expert_effective_rel_delta_count > 0.0:
+                expert_effective_rel_delta = (
+                    expert_effective_rel_delta_sum / expert_effective_rel_delta_count
+                )
+            else:
+                expert_effective_rel_delta = 0.0
+
+            expert_raw_rel_delta_layers.append(expert_raw_rel_delta)
+            expert_effective_rel_delta_layers.append(expert_effective_rel_delta)
 
             if owner_total_mass > 0.0:
                 non_owner_mass_frac_layers.append(owner_non_owner_mass / owner_total_mass)
@@ -354,19 +358,12 @@ class MoEAggregator:
                 owner_entropy_norm_layers.append(0.0)
 
             if dense_metric_count > 0.0:
-                dense_rel_delta_layers.append(
-                    float(self.dense_rel_delta_sum_layers[layer_idx].item()) / dense_metric_count
-                )
-                post_res_frac_layers.append(
-                    float(self.post_res_frac_sum_layers[layer_idx].item()) / dense_metric_count
-                )
-                final_rel_delta_layers.append(
-                    float(self.final_rel_delta_sum_layers[layer_idx].item()) / dense_metric_count
-                )
-            else:
-                dense_rel_delta_layers.append(0.0)
-                post_res_frac_layers.append(0.0)
-                final_rel_delta_layers.append(0.0)
+                dense_rel_delta = (float(self.dense_rel_delta_sum_layers[layer_idx].item()) / dense_metric_count)
+            else : 
+                dense_rel_delta = 0.0   
+            dense_rel_delta_layers.append(dense_rel_delta)
+            dense_to_expert_ratio_layers.append(dense_rel_delta / max(1e-8, expert_effective_rel_delta))
+                
 
         drop_rate = 1.0 - (total_processed / max(1.0, total_tokens))
         multi_assigned_token_rate, _, _ = self._mmm(multi_rate_layers)
@@ -376,10 +373,10 @@ class MoEAggregator:
         token_logit_entropy_mean, _, _ = self._mmm(token_logit_entropy_layers)
         non_owner_mass_frac, _, _ = self._mmm(non_owner_mass_frac_layers)
         owner_entropy_norm, _, _ = self._mmm(owner_entropy_norm_layers)
-        mean_rel_delta_mean, _, _ = self._mmm(mean_rel_delta_layers)
+        expert_raw_rel_delta_mean, _, _ = self._mmm(expert_raw_rel_delta_layers)
+        expert_effective_rel_delta_mean, _, _ = self._mmm(expert_effective_rel_delta_layers)
         dense_rel_delta_mean, _, _ = self._mmm(dense_rel_delta_layers)
-        post_res_frac_mean, _, _ = self._mmm(post_res_frac_layers)
-        final_rel_delta_mean, _, _ = self._mmm(final_rel_delta_layers)
+        dense_to_expert_ratio_mean, _, _ = self._mmm(dense_to_expert_ratio_layers)
 
         metrics = {
             "drop_rate": drop_rate,
@@ -390,32 +387,31 @@ class MoEAggregator:
             "logits_temp_std_mean": logits_temp_std_mean,
             "non_owner_mass_frac": non_owner_mass_frac,
             "owner_entropy_norm": owner_entropy_norm,
-            "mean_rel_delta_mean": mean_rel_delta_mean,
+            "expert_raw_rel_delta_mean": expert_raw_rel_delta_mean,
+            "expert_effective_rel_delta_mean": expert_effective_rel_delta_mean,
             "dense_rel_delta_mean": dense_rel_delta_mean,
-            "post_res_frac_mean": post_res_frac_mean,
-            "final_rel_delta_mean": final_rel_delta_mean,
+            "dense_to_expert_ratio_mean": dense_to_expert_ratio_mean,
         }
-
-        for moe_layer_idx in range(len(mean_rel_delta_layers)):
-            metrics[f"moe_layer_{moe_layer_idx}/non_owner_mass_frac"] = float(
-                non_owner_mass_frac_layers[moe_layer_idx]
-            )
-            metrics[f"moe_layer_{moe_layer_idx}/owner_entropy_norm"] = float(
-                owner_entropy_norm_layers[moe_layer_idx]
-            )
-
-            if include_layer_detail_metrics:
-                metrics[f"moe_layer_{moe_layer_idx}/mean_rel_delta"] = float(
-                    mean_rel_delta_layers[moe_layer_idx]
+        if include_layer_detail_metrics:
+            for moe_layer_idx in range(len(expert_raw_rel_delta_layers)):
+            
+                metrics[f"moe_layer_{moe_layer_idx}/non_owner_mass_frac"] = float(
+                    non_owner_mass_frac_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/owner_entropy_norm"] = float(
+                    owner_entropy_norm_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/expert_raw_rel_delta"] = float(
+                    expert_raw_rel_delta_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/expert_effective_rel_delta"] = float(
+                    expert_effective_rel_delta_layers[moe_layer_idx]
                 )
                 metrics[f"moe_layer_{moe_layer_idx}/dense_rel_delta"] = float(
                     dense_rel_delta_layers[moe_layer_idx]
                 )
-                metrics[f"moe_layer_{moe_layer_idx}/post_res_frac"] = float(
-                    post_res_frac_layers[moe_layer_idx]
-                )
-                metrics[f"moe_layer_{moe_layer_idx}/final_rel_delta"] = float(
-                    final_rel_delta_layers[moe_layer_idx]
+                metrics[f"moe_layer_{moe_layer_idx}/dense_to_expert_ratio"] = float(
+                    dense_to_expert_ratio_layers[moe_layer_idx]
                 )
         return metrics
 
@@ -461,17 +457,17 @@ class MoEAggregator:
             torch.zeros_like(c, dtype=torch.float64, device=self._device or c.device)
             for c in self.dense_rel_delta_sum_layers
         ]
-        self.post_res_frac_sum_layers = [
-            torch.zeros_like(c, dtype=torch.float64, device=self._device or c.device)
-            for c in self.post_res_frac_sum_layers
-        ]
-        self.final_rel_delta_sum_layers = [
-            torch.zeros_like(c, dtype=torch.float64, device=self._device or c.device)
-            for c in self.final_rel_delta_sum_layers
-        ]
         self.dense_metric_count_layers = [
             torch.zeros_like(c, dtype=torch.float64, device=self._device or c.device)
             for c in self.dense_metric_count_layers
+        ]
+        self.expert_effective_rel_delta_sum_layers = [
+            torch.zeros_like(c, dtype=torch.float64, device=self._device or c.device)
+            for c in self.expert_effective_rel_delta_sum_layers
+        ]
+        self.expert_effective_rel_delta_count_layers = [
+            torch.zeros_like(c, dtype=torch.float64, device=self._device or c.device)
+            for c in self.expert_effective_rel_delta_count_layers
         ]
 
         self.logits_std_sum_layers = [0.0 for _ in range(self.num_layers)]

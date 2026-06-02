@@ -95,8 +95,6 @@ if __name__ == "__main__":
     temp_final = 0.75
     temp_epochs = 25
     
-    covarage_init = 1e-3
-    covarage_final = 1e-4
     # Training metrics
     train_epochs = 80
     uniform_epochs = 10
@@ -112,7 +110,7 @@ if __name__ == "__main__":
 
     print(f'--- Dataset loaded --- \n')
 
-    run_name = f"test {num_exp} experts - Patching-Overlap  | Expert -> Token | cov loss"
+    run_name = f"test {num_exp} experts - Patching-Overlap  | Expert -> Token | Cov Losses new W"
 
     # Defines checkpointer and Logger
     logger = WandbLogger(
@@ -139,6 +137,7 @@ if __name__ == "__main__":
         capacity_factor_train = capacity_factor_train,
         capacity_factor_val = capacity_factor_val,
         halo_for_patches=halo_for_patches,
+        use_static_map=False
         )
     # pce = torch.compile(pce, mode="reduce-overhead")
 
@@ -146,7 +145,6 @@ if __name__ == "__main__":
         pce=pce, lr=lr, weight_decay=weight_decay, device=device, train_epochs=train_epochs, 
         uniform_epochs=uniform_epochs, temp_init=temp_init, temp_mid = temp_mid, 
         temp_final=temp_final,temp_epochs=temp_epochs, num_classes=num_classes, router_lr = router_lr,
-        covarage_final=covarage_final, covarage_init=covarage_init
     )
     trainer = pl.Trainer(
         max_epochs=train_epochs,

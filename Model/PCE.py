@@ -22,6 +22,8 @@ class PCENetwork(nn.Module):
                     capacity_factor_train,
                     capacity_factor_val,
                     halo_for_patches,
+                    input_size = 224, 
+                    use_static_map = False,
                  ):
         super().__init__()
 
@@ -42,16 +44,17 @@ class PCENetwork(nn.Module):
 
         self.num_classes = num_classes
         self.num_experts = num_experts
+        self.halo_for_patches = halo_for_patches
+        self.input_size = input_size
+        self.use_static_map = use_static_map
 
         self.patch_extractor = PatchExtractor(patch_size)
-
         self.layers = nn.ModuleList()
-
-        self.halo_for_patches = halo_for_patches
-
         last_channel = self.create_layers(
             num_experts=num_experts,
             layer_number=layer_number,
+            input_size = input_size, 
+            use_static_map = use_static_map
         )        
 
         self.router = Router(
@@ -81,21 +84,21 @@ class PCENetwork(nn.Module):
             num_layers=len(num_experts_per_layer),
             num_experts=num_experts_per_layer,
         )
-    def create_layers(self, num_experts, layer_number):
+    def create_layers(self, num_experts, layer_number, input_size, use_static_map):
         """
         Create layers of PCE Network
 
         Args:
-            inpt_channel (int) -> Input channel of the first layer
-            out_channel (int) -> Output channel of the first layer
-            num_experts (int) -> Number of experts in each layer
-            dropout (float) -> Dropout probability for experts
-            layer_number (int) -> Number of layers in the network
-        Returns:
-            None
+            num_experts : Number of experts for layer l
+            layer_number : Number of ResNet Layer 
+            input_size : Dimension of the input H x W
+            use_static_map : Set if the model use the static or dynamic routing mapping 
         """
         def get_fourie_channel(F):
             return 2 + 4 * F
+
+        def conv_out_size(size, kernel_size, stride, padding, dilation = 1):
+            return ((size + 2 * padding - dilation * (kernel_size - 1) -  1) // stride) + 1
         
         # Setting start parameters
         patch_size = self.patch_extractor.patch_size
@@ -105,6 +108,10 @@ class PCENetwork(nn.Module):
         fourier_channel =  get_fourie_channel(fourier_freq)
         inpt_channel = 64
         out_channel = 64
+
+        # After stem : Conv2d(3, 64, kernel_size = 7, stride = 2, padding = 3)
+        current_h = conv_out_size(input_size, kernel_size=7, stride=2, padding=3)
+        current_w = conv_out_size(input_size, kernel_size=7, stride=2, padding=3)
 
         for l in range(layer_number):
             current_gate_channel = inpt_channel + fourier_channel
@@ -121,7 +128,16 @@ class PCENetwork(nn.Module):
                 patch_size = max(2, patch_size // 2)
                 unfold_kernel_size = patch_size + 2 * self.halo_for_patches
 
+                # After downsample 
+                current_h = conv_out_size(current_h, kernel_size=3, stride=2, padding=1)
+                current_w = conv_out_size(current_w, kernel_size=3, stride=2, padding=1)
+
             else:
+                # Compute number of patches
+                h_position = current_h // patch_size
+                w_position = current_w // patch_size
+                P = h_position * w_position
+
                 self.layers.append(PCELayer(
                     inpt_channel=inpt_channel,
                     out_channel=out_channel,
@@ -130,7 +146,9 @@ class PCENetwork(nn.Module):
                     fourie_freq=fourier_freq,
                     gate_channel=current_gate_channel,
                     kernel_size = 3,
-                    unfold_kernel_size = unfold_kernel_size
+                    unfold_kernel_size = unfold_kernel_size,
+                    num_positions = P,
+                    use_static_map = use_static_map
                 ))
                 
         return out_channel
@@ -165,10 +183,9 @@ class PCENetwork(nn.Module):
         Returns:
             logits (torch.tensor) : tensor beatches (B, num_classes)
         """
-        tot_z_loss = []
-        tot_div_loss = []
-        tot_overlap_loss = []
-        tot_balance_loss= []
+        tot_z_loss  = 0.0
+        tot_balance_loss = 0.0
+        tot_overlap_loss = 0.0
 
         img_device = X.device
         B = X.shape[0]
@@ -187,7 +204,6 @@ class PCENetwork(nn.Module):
                 experts = layer.experts
                 merge_gn = layer.merge_gn
                 merge_act = layer.activation_merge
-                gamma = layer.gamma
                 post_block = layer.post_block
                 unfold_kernel_size = layer.unfold_kernel_size
                 
@@ -216,11 +232,12 @@ class PCENetwork(nn.Module):
                 positional_features = positional_features.flatten(0, 1)
                 
                 # Route patches to experts and compute auxiliary losses
-                routing_state, overlap_loss, balance_loss, z_loss, div_loss, logits_std, logits_temp_std, logits = self.router(
+                routing_state, balance_loss, overlap_loss, z_loss, logits_std, logits_temp_std, logits = self.router(
                     X_tokens, 
                     layer.router_gate, 
                     positional_features,
-                    current_epoch,
+                    num_positions=P,
+                    current_epoch = current_epoch,
                 )
 
                 if collect_routes:
@@ -278,6 +295,8 @@ class PCENetwork(nn.Module):
                     y_e = expert(x_e)
                     y_e = self.crop_center(y_e, patch_size)
 
+                    w_e = per_exp_weights[e] # Shape : [k_e, 1, 1, 1]
+
                     delta_e = y_e - x_e_center
                     with torch.no_grad():
                         rel_delta = delta_e.detach().flatten(1).norm(dim=1) / (
@@ -285,8 +304,23 @@ class PCENetwork(nn.Module):
                         )
                         rel_delta_sum += float(rel_delta.sum().item())
                         rel_delta_count += int(rel_delta.numel())
-                    contrib = delta_e * per_exp_weights[e].to(dtype=y_e.dtype)
+                    contrib = delta_e * w_e.to(dtype=y_e.dtype)
                     outputs.index_add_(0, n_e, contrib)
+
+                # Reassemble patches back into spatial feature map
+                _, C_out, H_out, W_out = outputs.shape
+
+                with torch.no_grad():
+                    eps = 1e-8
+
+                    expert_effective_delta = outputs.detach() - X_center.detach()
+
+                    expert_effective_rel_delta = (
+                        expert_effective_delta.flatten(1).norm(dim=1) / (X_center.detach().flatten(1).norm(dim=1) + eps)
+                    )
+
+                    expert_effective_rel_delta_sum = float(expert_effective_rel_delta.sum().item())
+                    expert_effective_rel_delta_count = int(expert_effective_rel_delta.numel())
 
                 with torch.no_grad():
                     self.moe_aggregator.update_layer(
@@ -300,10 +334,9 @@ class PCENetwork(nn.Module):
                         weights=routing_state.weights.detach(),
                         rel_delta_sum=rel_delta_sum,
                         rel_delta_count=rel_delta_count,
+                        expert_effective_rel_delta_sum=expert_effective_rel_delta_sum,
+                        expert_effective_rel_delta_count=expert_effective_rel_delta_count,
                     )
-
-                # Reassemble patches back into spatial feature map
-                _, C_out, H_out, W_out = outputs.shape
 
                 X = rearrange(
                     outputs.view(B, P, C_out, H_out, W_out), 
@@ -313,55 +346,41 @@ class PCENetwork(nn.Module):
                 X_sparse = X
 
                 # Dense and residual block
-                moe_out_pre_post = merge_gn(X)
-                moe_out_pre_post = merge_act(moe_out_pre_post)
-                res = post_block(moe_out_pre_post)
-                moe_out = moe_out_pre_post + res
-                X = X + moe_out
+                dens_in = merge_act(merge_gn(X))
+                dense_delta = post_block(dens_in)
+                X = X + dense_delta
 
                 with torch.no_grad():
-                    dense_eps = 1e-8
+                    eps = 1e-8
+
                     sparse_norm = X_sparse.detach().flatten(1).norm(dim=1).mean()
-                    pre_post_norm = moe_out_pre_post.detach().flatten(1).norm(dim=1).mean()
                     dense_rel_delta = (
-                        moe_out.detach().flatten(1).norm(dim=1).mean()
-                        / (sparse_norm + dense_eps)
+                        dense_delta.detach().flatten(1).norm(dim = 1).mean() / (sparse_norm + eps)
                     )
-                    post_res_frac = (
-                        res.detach().flatten(1).norm(dim=1).mean()
-                        / (pre_post_norm + dense_eps)
-                    )
-                    final_rel_delta = (
-                        (X.detach() - X_sparse.detach()).flatten(1).norm(dim=1).mean()
-                        / (sparse_norm + dense_eps)
-                    )
+
                     self.moe_aggregator.update_dense_layer(
                         layer_idx=layer_idx,
                         dense_rel_delta=float(dense_rel_delta.item()),
-                        post_res_frac=float(post_res_frac.item()),
-                        final_rel_delta=float(final_rel_delta.item()),
                         device=X.device,
                     )
 
-                tot_z_loss.append(z_loss)
-                tot_balance_loss.append(balance_loss)
-                tot_div_loss.append(div_loss)
-                tot_overlap_loss.append(overlap_loss)
+                tot_z_loss += z_loss
+                tot_balance_loss += balance_loss
+                tot_overlap_loss += overlap_loss
 
         # Apply global pooling and prediction head
         x = self.pooler(X) 
         x = self.flatten(x) 
         logits = self.prediction_head(x) 
         
-        tot_z_loss = torch.stack(tot_z_loss).mean()
-        tot_div_loss = torch.stack(tot_div_loss).mean()
-        tot_overlap_loss = torch.stack(tot_overlap_loss).mean() + 0.5 * torch.stack(tot_overlap_loss).max()
-        tot_balance_loss = torch.stack(tot_balance_loss).mean() + 0.5 * torch.stack(tot_balance_loss).max()
+        tot_z_loss = tot_z_loss / E
+        tot_balance_loss = tot_balance_loss / E
+        tot_overlap_loss = tot_overlap_loss / E
 
         if collect_routes:
-            return logits, tot_overlap_loss, tot_balance_loss, tot_z_loss, tot_div_loss, routing_debug
+            return logits, tot_balance_loss, tot_overlap_loss, tot_z_loss, routing_debug
 
-        return logits, tot_overlap_loss, tot_balance_loss, tot_z_loss, tot_div_loss
+        return logits, tot_balance_loss, tot_overlap_loss, tot_z_loss,
 
 
     def _indices_from_dispatch(self, dispatch):

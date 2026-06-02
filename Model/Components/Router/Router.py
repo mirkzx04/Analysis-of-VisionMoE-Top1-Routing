@@ -50,7 +50,7 @@ class Router(nn.Module):
         self.router_temp = router_temp
 
 
-    def forward(self, X, router_gate, positional_features, current_epoch = None):
+    def forward(self, X, router_gate, positional_features, num_positions = None, current_epoch = None):
         """
         Router forward pass with automatic phase management based on epochs.
 
@@ -86,9 +86,99 @@ class Router(nn.Module):
         if current_epoch == None:
             return self._specialized_routing(X, logits_temp, logits_std, logits_temp_std, z_loss)
         if current_epoch < 10:
-            return self._uniform_routing(X, logits_temp, logits_std, logits_temp_std)
+            return self._uniform_routing(X, logits_temp, logits_std, logits_temp_std, z_loss)
+        if getattr(router_gate, "is_static_map", False):
+            return self._static_expert_region_routing(X, logits_temp, logits_std, logits_temp_std, z_loss, num_positions)
         else:
             return self._specialized_routing(X, logits_temp, logits_std, logits_temp_std, z_loss)
+    
+    def _static_expert_region_routing(
+        self,
+        X,
+        logits,
+        logits_std,
+        logits_temp_std,
+        z_loss,
+        num_positions,
+    ):
+        """
+        Static expert -> region routing.
+
+        X: [B*P, C, H, W]
+        logits: [B*P, E], prodotti da StaticFourierMapGate, quindi dipendono solo dalla posizione
+        num_positions: P, numero di posizioni/patch per immagine
+        """
+
+        N = X.shape[0]
+        E = self.num_experts
+        P = int(num_positions)
+
+        if N % P != 0:
+            raise ValueError(f"N={N} must be divisible by num_positions={P}")
+
+        B = N // P
+
+        # [B*P, E] -> [B, P, E]
+        logits_bpe = logits.view(B, P, E)
+
+        # Siccome il gate è statico, ogni immagine dovrebbe avere la stessa mappa.
+        # Uso mean(0) invece di [0] per evitare dipendenze spurie dalla prima immagine.
+        logits_pos = logits_bpe.mean(dim=0)  # [P, E]
+
+        probs_pos = F.softmax(logits_pos.float(), dim=-1)  # [P, E]
+
+        # Capacità per esperto in termini di posizioni per immagine
+        cap_factor = self.capacity_factor_train if self.training else self.capacity_factor_eval
+        k_pos = max(1, math.ceil(cap_factor * P / E))
+        k_pos = min(k_pos, P)
+
+        # Expert-choice statico:
+        # ogni esperto sceglie le sue k_pos posizioni preferite
+        topk_prob, topk_pos = torch.topk(
+            probs_pos,
+            k=k_pos,
+            dim=0,
+            largest=True,
+            sorted=True,
+        )  # [k_pos, E]
+
+        # Replica la stessa mappa per ogni immagine del batch
+        batch_offsets = torch.arange(B, device=X.device).view(B, 1, 1) * P
+        token_idx = (topk_pos.view(1, k_pos, E) + batch_offsets).reshape(-1)
+
+        expert_idx = (
+            torch.arange(E, device=X.device)
+            .view(1, 1, E)
+            .expand(B, k_pos, E)
+            .reshape(-1)
+        )
+
+        # Slot locali per esperto: [0 ... B*k_pos-1]
+        slot_idx = (
+            torch.arange(k_pos, device=X.device)
+            .view(1, k_pos, 1)
+            .expand(B, k_pos, E)
+            + torch.arange(B, device=X.device).view(B, 1, 1) * k_pos
+        ).reshape(-1)
+
+        weights = (
+            topk_prob.view(1, k_pos, E)
+            .expand(B, k_pos, E)
+            .reshape(-1)
+            .float()
+        )
+
+        routing_state = RoutingState(
+            token_idx=token_idx,
+            expert_idx=expert_idx,
+            slot_idx=slot_idx,
+            weights=weights,
+            num_experts=E,
+            num_tokens=N,
+            capacity=B * k_pos,
+        )
+
+        return routing_state, z_loss, logits_std, logits_temp_std, logits.detach()
 
     def _specialized_routing(self, X, logits, logits_std, logits_temp_std, z_loss):
         """
@@ -106,7 +196,7 @@ class Router(nn.Module):
             logits = logits + noise
         
         probs_e2t = F.softmax(logits.float(), dim = -1) # [N, E]
-        div_loss = self.diverity_loss(probs_e2t)
+        # div_loss = self.diverity_loss(probs_e2t)
 
         # Calculate capacity per expert (must be an integer)
         cap_factor = self.capacity_factor_train if self.training else self.capacity_factor_eval
@@ -147,9 +237,9 @@ class Router(nn.Module):
             capacity=k
         )
 
-        return routing_state, overlap_loss, balance_loss, z_loss, div_loss, logits_std, logits_temp_std, logits.detach()
+        return routing_state, balance_loss, overlap_loss, z_loss, logits_std, logits_temp_std, logits.detach()
 
-    def _uniform_routing(self, X, logits, logits_std, logits_temp_std):
+    def _uniform_routing(self, X, logits, logits_std, logits_temp_std, z_loss):
         """
         Uniform routing (Phase 1).
         
@@ -184,11 +274,10 @@ class Router(nn.Module):
         )
 
         z_loss = torch.tensor(0.0, device=X.device, dtype=torch.float32)
-        div_loss = torch.tensor(0.0, device=X.device, dtype=torch.float32)
         overlap_loss = torch.tensor(0.0, device=X.device, dtype=torch.float32)
         balance_loss = torch.tensor(0.0, device=X.device, dtype=torch.float32)
 
-        return routing_state, overlap_loss, balance_loss, z_loss, div_loss, logits_std, logits_temp_std, logits.detach()
+        return routing_state, balance_loss, overlap_loss, z_loss, logits_std, logits_temp_std, logits.detach()
     
     def z_loss(self, logits):
         """
@@ -200,31 +289,26 @@ class Router(nn.Module):
 
         return torch.logsumexp(logits, dim = -1).square().mean()
     
-    def diverity_loss(self, probs):
-        """
-        Encourage different experts to have different different activation patterns.
-
-        Args: 
-            logits (torch.Tensor): Router logits [N, num_experts].
-        """
-
-        # Probs : [N, E]
-        E = probs.shape[-1]
-        if E <= 1:
-            return probs.new_tensor(0.0)
-        
-        probs_norm = F.normalize(probs, dim = 0, p = 2) # Shape : [N, E]
-        corr = probs_norm.t() @ probs_norm # Shape [E, E]
-        I = torch.eye(E, device=probs.device, dtype=probs.dtype)
-        return ((corr - I) ** 2).mean()
-
-
     def compute_overlap_loss(
         self, 
         probs_e2t, 
         topk_idx, 
         k
     ):
+        """
+        Pairwise soft overlap loss for expert-choice routing.
+
+        Args:
+            probs_e2t: router probabilities after softmax over experts.
+                    Shape [N, E]
+            topk_idx: unused here, kept for API compatibility.
+                    Shape [k, E]
+            k: unused here, kept for API compatibility.
+
+        Returns:
+            Scalar loss. Lower means less pairwise overlap between experts.
+        """
+        
         """
         Soft token coverage loss for expert-choice routing.
         Kept under the overlap-loss slot for compatibility with the
@@ -249,13 +333,12 @@ class Router(nn.Module):
         relative_coverage = expected_assignments / target.clamp_min(1e-8)
 
         return (relative_coverage - 1.0).pow(2).mean()
-
+        
     def compute_balance_loss(
         self, 
         probs_e2t,
         topk_idx, 
-        min_owner_frac = 0.95,
-        l2_weight = 0.2
+        min_owner_frac = 0.30,
     ) :
 
         """
@@ -310,8 +393,4 @@ class Router(nn.Module):
         floor_violation = F.relu(min_owner - owner_dist) / min_owner.clamp_min(1e-8)
         floor_loss = floor_violation.mean()
 
-        # Mild L2 toward uniform, useful to avoid barely-satisfying the floor
-        uniform = torch.full_like(owner_dist, 1.0 / float(E))
-        l2_loss = (owner_dist - uniform).pow(2).sum()
-
-        return floor_loss + l2_weight * l2_loss
+        return floor_loss

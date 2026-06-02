@@ -66,7 +66,7 @@ class ConvExpert(nn.Module):
                 self.skip = nn.Identity()
 
         last_conv = self.conv_block[3]
-        nn.init.zeros_(last_conv.weight)
+        nn.init.normal_(last_conv.weight, mean=0.0, std=5e-3)
 
     def forward(self, X):
         out = self.conv_block(X)

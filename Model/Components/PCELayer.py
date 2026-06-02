@@ -3,7 +3,7 @@ import torch
 from torch import nn
 
 from .ConvExpert import ConvExpert
-from Model.Components.Router.RouterGate import RouterGate
+from Model.Components.Router.RouterGate import RouterGate, StaticFourierMapGate
 
 class PCELayer(nn.Module):
     def __init__(self,
@@ -15,6 +15,8 @@ class PCELayer(nn.Module):
                 gate_channel,
                 kernel_size,
                 unfold_kernel_size,
+                num_positions = None, 
+                use_static_map = False,
                 ):
         super().__init__()
         self.experts = nn.ModuleList([
@@ -28,15 +30,21 @@ class PCELayer(nn.Module):
         ])
         self.merge_gn = nn.GroupNorm(num_groups=min(8, out_channel), num_channels=out_channel)
         self.activation_merge = nn.SiLU(inplace=True)
-        self.router_gate = RouterGate(
-            gate_channel, 
-            num_experts,
-            unfold_kernel_size,
-            unfold_kernel_size
-        )
-        
-        self.gamma = nn.Parameter(torch.ones(1) * 1e-2)
-        
+
+        if use_static_map : 
+            self.router_gate = StaticFourierMapGate(
+                num_experts=num_experts, 
+                P = num_positions,
+            )
+        else : 
+            self.router_gate = RouterGate(
+                semantic_channel=inpt_channel, 
+                fourier_channel= 2 + 4 * fourie_freq, 
+                num_experts=num_experts, 
+                patch_h=unfold_kernel_size,
+                patch_w=unfold_kernel_size
+            )
+                
         self.patch_size = patch_size
         self.fourier_freq = fourie_freq
         self.unfold_kernel_size = unfold_kernel_size        
@@ -46,3 +54,4 @@ class PCELayer(nn.Module):
             nn.GroupNorm(num_channels=out_channel, num_groups=min(8, out_channel)),
             nn.SiLU(inplace=True)
         )
+        nn.init.zeros_(self.post_block[0].weight)
