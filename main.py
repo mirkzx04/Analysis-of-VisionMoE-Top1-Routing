@@ -1,6 +1,5 @@
 import os
-import numpy as np 
-import matplotlib.pyplot as plt
+import numpy as np
 import json
 
 import torch
@@ -27,8 +26,29 @@ from Model.PCE import PCENetwork
 
 from EMADiffLitModule import EMADiffLitModule
 
-def count_number_of_classes(train_labels, val_labels):   
+def count_number_of_classes(train_labels, val_labels):
     return len(np.unique(np.concatenate([train_labels, val_labels])).tolist())
+
+def get_accelerator_and_precision():
+    if not torch.cuda.is_available():
+        return "cpu", "32-true"
+
+    device_name = torch.cuda.get_device_name(0)
+    major, minor = torch.cuda.get_device_capability(0)
+    cuda_arches = getattr(torch._C, "_cuda_getArchFlags", lambda: "")()
+
+    print(f"-- CUDA GPU: {device_name} | compute capability: {major}.{minor} ---")
+    print(f"-- PyTorch CUDA: {torch.version.cuda} | compiled arches: {cuda_arches or 'unknown'} ---")
+
+    if torch.cuda.is_bf16_supported():
+        return "cuda", "bf16-mixed"
+
+    if major >= 7:
+        print("-- BF16 not supported on this GPU: using precision='16-mixed' ---")
+        return "cuda", "16-mixed"
+
+    print("-- Mixed precision not enabled for this GPU: using precision='32-true' ---")
+    return "cuda", "32-true"
 
 def get_tinyimagenet_sets(batch_size, tinyimagenet_path = 'Data/tiny-imagenet-200'):
     """
@@ -73,8 +93,9 @@ if __name__ == "__main__":
 
     train_datasets = []
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device, precision = get_accelerator_and_precision()
     print(f'-- Start with device : {device} ---')
+    print(f'-- Trainer precision : {precision} ---')
     print('\n ------------------------ \n')
 
     # Hyperparameters of model
@@ -86,15 +107,15 @@ if __name__ == "__main__":
     weight_decay = 1e-3 # M
 
     # Hyperparameters of router
-    capacity_factor_train = 1.00
-    capacity_factor_val = 1.00
+    capacity_factor_train = 2.00
+    capacity_factor_val = 2.00
     halo_for_patches = 2
 
     temp_init = 1.75
     temp_mid = 1.2
-    temp_final = 0.75
+    temp_final = 0.50
     temp_epochs = 25
-    
+
     # Training metrics
     train_epochs = 80
     uniform_epochs = 10
@@ -110,7 +131,7 @@ if __name__ == "__main__":
 
     print(f'--- Dataset loaded --- \n')
 
-    run_name = f"test {num_exp} experts - Patching-Overlap  | Expert -> Token | Cov Losses new W"
+    run_name = f"test {num_exp} experts - Patching-Overlap  | Expert -> Token -Branch Routing"
 
     # Defines checkpointer and Logger
     logger = WandbLogger(
@@ -142,14 +163,14 @@ if __name__ == "__main__":
     # pce = torch.compile(pce, mode="reduce-overhead")
 
     lit_module = EMADiffLitModule(
-        pce=pce, lr=lr, weight_decay=weight_decay, device=device, train_epochs=train_epochs, 
-        uniform_epochs=uniform_epochs, temp_init=temp_init, temp_mid = temp_mid, 
+        pce=pce, lr=lr, weight_decay=weight_decay, device=device, train_epochs=train_epochs,
+        uniform_epochs=uniform_epochs, temp_init=temp_init, temp_mid = temp_mid,
         temp_final=temp_final,temp_epochs=temp_epochs, num_classes=num_classes, router_lr = router_lr,
     )
     trainer = pl.Trainer(
         max_epochs=train_epochs,
         logger = logger,
-        precision='32',
+        precision=precision,
         accelerator=device,
         enable_checkpointing= True,
         callbacks=[checkpoint_callback],
@@ -167,10 +188,9 @@ if __name__ == "__main__":
 
     del pce, lit_module, trainer, logger
     torch.cuda.empty_cache()
-    gc.collect()       
+    gc.collect()
 
 
 
 
 
-    

@@ -1,10 +1,9 @@
 import math
 
 import torch
-from torch.distributions import OneHotCategorical
 import torch.nn.functional as F
 
-from torch import logit, nn
+from torch import nn
 from dataclasses import dataclass
 
 @dataclass(slots=True)
@@ -25,6 +24,7 @@ class Router(nn.Module):
         router_temp = 1.5,
         capacity_factor_train = 1.25,
         capacity_factor_eval = 1.50,
+        sem_weight_temp = 1.0,
         ):
         super().__init__()
         """
@@ -35,6 +35,8 @@ class Router(nn.Module):
             num_layers (int): Number of layers.
             noise_epsilon (float): Epsilon for noise stability.
             router_temp (float): Temperature for the router logits.
+            sem_weight_temp (float): Temperature of the semantic weighting softmax,
+                renormalized per token over the experts that selected it (S(n)).
             capacity_factor_train (float): Capacity factor during training.
             capacity_factor_eval (float): Capacity factor during evaluation.
             noise_std (float): Standard deviation for the noise added to logits.
@@ -42,15 +44,26 @@ class Router(nn.Module):
         """
         self.num_experts = num_experts
         self.num_layers = num_layers
-        
+
         self.capacity_factor_train = capacity_factor_train
         self.capacity_factor_eval = capacity_factor_eval
         self.noise_std = 0
 
         self.router_temp = router_temp
+        self.sem_weight_temp = sem_weight_temp
 
 
-    def forward(self, X, router_gate, positional_features, num_positions = None, current_epoch = None):
+    def forward(
+        self,
+        X,
+        router_gate,
+        positional_features,
+        num_positions = None,
+        current_epoch = None,
+        h_patches = None,
+        w_patches = None,
+        unified_router = False,
+        collect_metrics = False,):
         """
         Router forward pass with automatic phase management based on epochs.
 
@@ -58,47 +71,87 @@ class Router(nn.Module):
             X (torch.Tensor): Input tensor of shape [N, C, H, W] (or flattened [B*P, ...]).
             router_gate (nn.Module): The gate module to compute logits.
             current_epoch (int, optional): Current training epoch to determine routing phase.
-        
+
         Returns:
             dispatch (torch.Tensor): Dispatch tensor for routing.
             combine (torch.Tensor): Combine tensor for aggregating results.
             z_loss (torch.Tensor): Z-loss value.
             aux_loss (torch.Tensor): Auxiliary load balancing loss.
-            logits_std (float): Standard deviation of raw logits (for monitoring).
-            logits_temp_std (float): Standard deviation of temperature-scaled logits.
             logits (torch.Tensor): Raw logits (detached, on CPU).
+            logit_stats (dict): Optional router std metrics, including the
+                selection logits and branch-level positional/semantic logits.
         """
 
         N = X.shape[0] # Total number of patches
         E = self.num_experts
+        unified_router = bool(unified_router or getattr(router_gate, "unified_router", False))
 
-        # Always compute logits for monitoring and potential use
-        logits = router_gate(X, positional_features).to(dtype=torch.float32) # [N, Es]
-        logits_std = logits.detach().std().item()
+        # Always compute logits for monitoring and potential use.
+        # RouterGate returns separated semantic/positional logits only when the
+        # positional branch exists independently; unified/static gates return
+        # already-combined logits.
+        gate_out = router_gate(X, positional_features)
+        spatial_loss = X.new_tensor(0.0, dtype=torch.float32)
+        logit_stats = {
+            "logits_std": None,
+            "logits_temp_std": None,
+            "logits_std_pos": None,
+            "logits_std_sem": None,
+            "logits_temp_std_pos": None,
+            "logits_temp_std_sem": None,
+        }
 
-        logits_temp = logits / self.router_temp
-        z_loss = self.z_loss(logits_temp)
+        if isinstance(gate_out, tuple):
+            sem_logits, pos_logits = gate_out
+            sem_logits, pos_logits = sem_logits.float(), pos_logits.float()
+            
+            # Selection by position only; semantics only weights the chosen expert's
+            # output (0.8*sem + 0.2*pos) downstream in _specialized_routing.
+            weighting_logits = sem_logits
+            selection_logits = pos_logits
 
-        logits_temp_std = logits_temp.detach().std().item()
-        logits_temp = logits_temp.clamp(min = -10.0, max = 10.0)
+            logits_router = (selection_logits, weighting_logits)
+            if ( self.training and not getattr(router_gate, "is_static_map", False) and not unified_router and h_patches is not None and w_patches is not None):
+                spatial_loss = self.spatial_loss(pos_logits, h_patches, w_patches)
+            z_loss = self.z_loss(weighting_logits)
+
+            if collect_metrics:
+                logit_stats.update({
+                    "logits_std_pos": pos_logits.detach().std(),
+                    "logits_std_sem": sem_logits.detach().std(),
+                    "logits_temp_std_pos": (pos_logits / self.router_temp).detach().std(),
+                    "logits_temp_std_sem": (sem_logits / self.router_temp).detach().std(),
+                })
+        else:
+            logits_router = gate_out.to(dtype=torch.float32)
+            z_loss = self.z_loss(logits_router)
+            spatial_loss = self.spatial_loss(pos_logits, h_patches, w_patches)
+            if collect_metrics:
+                logit_stats.update({
+                    "logits_std": logits_router.detach().std(),
+                    "logits_temp_std": (logits_router / self.router_temp).detach().std(),
+                })
+                if getattr(router_gate, "is_static_map", False):
+                    logit_stats["logits_std_pos"] = logit_stats["logits_std"]
+                    logit_stats["logits_temp_std_pos"] = logit_stats["logits_temp_std"]
 
         # Route based on current phase (Uniform < 30 epochs, Specialized >= 30 epochs)
         if current_epoch == None:
-            return self._specialized_routing(X, logits_temp, logits_std, logits_temp_std, z_loss)
+            return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
         if current_epoch < 10:
-            return self._uniform_routing(X, logits_temp, logits_std, logits_temp_std, z_loss)
+            return self._uniform_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
         if getattr(router_gate, "is_static_map", False):
-            return self._static_expert_region_routing(X, logits_temp, logits_std, logits_temp_std, z_loss, num_positions)
+            return self._static_expert_region_routing(X, logits_router, logit_stats, z_loss, spatial_loss, num_positions)
         else:
-            return self._specialized_routing(X, logits_temp, logits_std, logits_temp_std, z_loss)
-    
+            return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
+
     def _static_expert_region_routing(
         self,
         X,
         logits,
-        logits_std,
-        logits_temp_std,
+        logit_stats,
         z_loss,
+        spatial_loss,
         num_positions,
     ):
         """
@@ -125,7 +178,7 @@ class Router(nn.Module):
         # Uso mean(0) invece di [0] per evitare dipendenze spurie dalla prima immagine.
         logits_pos = logits_bpe.mean(dim=0)  # [P, E]
 
-        probs_pos = F.softmax(logits_pos.float(), dim=-1)  # [P, E]
+        probs_pos = F.softmax(logits_pos.float() / self.router_temp, dim=-1)  # [P, E]
 
         # Capacità per esperto in termini di posizioni per immagine
         cap_factor = self.capacity_factor_train if self.training else self.capacity_factor_eval
@@ -144,105 +197,115 @@ class Router(nn.Module):
 
         # Replica la stessa mappa per ogni immagine del batch
         batch_offsets = torch.arange(B, device=X.device).view(B, 1, 1) * P
-        token_idx = (topk_pos.view(1, k_pos, E) + batch_offsets).reshape(-1)
-
-        expert_idx = (
-            torch.arange(E, device=X.device)
-            .view(1, 1, E)
-            .expand(B, k_pos, E)
-            .reshape(-1)
+        token_idx = (
+            topk_pos.view(1, k_pos, E)
+            .add(batch_offsets)
+            .permute(2, 0, 1)
+            .reshape(E, B * k_pos)
         )
 
-        # Slot locali per esperto: [0 ... B*k_pos-1]
-        slot_idx = (
-            torch.arange(k_pos, device=X.device)
-            .view(1, k_pos, 1)
-            .expand(B, k_pos, E)
-            + torch.arange(B, device=X.device).view(B, 1, 1) * k_pos
-        ).reshape(-1)
-
+        expert_idx = torch.arange(E, device=X.device).view(E, 1).expand(E, B * k_pos)
+        slot_idx = torch.arange(B * k_pos, device=X.device).view(1, B * k_pos).expand(E, B * k_pos)
         weights = (
             topk_prob.view(1, k_pos, E)
             .expand(B, k_pos, E)
-            .reshape(-1)
+            .permute(2, 0, 1)
+            .reshape(E, B * k_pos)
             .float()
         )
 
         routing_state = RoutingState(
-            token_idx=token_idx,
-            expert_idx=expert_idx,
-            slot_idx=slot_idx,
-            weights=weights,
+            token_idx=token_idx.reshape(-1),
+            expert_idx=expert_idx.reshape(-1),
+            slot_idx=slot_idx.reshape(-1),
+            weights=weights.reshape(-1),
             num_experts=E,
             num_tokens=N,
             capacity=B * k_pos,
         )
 
-        return routing_state, z_loss, logits_std, logits_temp_std, logits.detach()
+        return routing_state, spatial_loss, z_loss, logits.detach(), logit_stats
 
-    def _specialized_routing(self, X, logits, logits_std, logits_temp_std, z_loss):
+    def _specialized_routing(self, X, logits, logit_stats, z_loss, spatial_loss):
         """
         Specialized top-1 routing (Phase 2/3).
-        
-        Standard Mixture-of-Experts (MoE) routing where tokens are assigned to the 
+
+        Standard Mixture-of-Experts (MoE) routing where tokens are assigned to the
         expert with the highest probability (Top-1), subject to capacity constraints.
         """
         N = X.shape[0] # Total numbers of patches
         E = self.num_experts
-        
-        # Adding noise in logits 
+
+        # Adding noise in logits (only the selection branch when decoupled)
         if self.training and self.noise_std > 0:
-            noise = torch.randn_like(logits.float()) * self.noise_std
-            logits = logits + noise
-        
-        probs_e2t = F.softmax(logits.float(), dim = -1) # [N, E]
-        # div_loss = self.diverity_loss(probs_e2t)
+            if isinstance(logits, tuple):
+                logits = (logits[0] + torch.randn_like(logits[0]) * self.noise_std, logits[1])
+            else:
+                logits = logits + torch.randn_like(logits.float()) * self.noise_std
+
+        if isinstance(logits, tuple) :
+            probs_e2t = F.softmax(logits[0] / self.router_temp, dim = -1)
+        else :
+            probs_e2t = F.softmax(logits.float() / self.router_temp, dim = -1) # [N, E]
 
         # Calculate capacity per expert (must be an integer)
         cap_factor = self.capacity_factor_train if self.training else self.capacity_factor_eval
         ccap = math.ceil(cap_factor * N / E)
         k = min(max(1, int(ccap)), N)
 
-        # Extract topk probs and topk index 
+        # Extract topk probs and topk index
         topk_prob, topk_idx = torch.topk(
-            probs_e2t, 
-            k = k, 
+            probs_e2t,
+            k = k,
             dim = 0,
             largest=True,
             sorted=True,
         )
 
-        token_idx = topk_idx.reshape(-1)
-        expert_idx = torch.arange(E, device=X.device).unsqueeze(0).expand(k, E).reshape(-1)
-        slot_idx = torch.arange(k, device=X.device).unsqueeze(1).expand(k, E).reshape(-1)
+        token_idx = topk_idx.transpose(0, 1).contiguous()
+        expert_idx = torch.arange(E, device=X.device).view(E, 1).expand(E, k)
+        slot_idx = torch.arange(k, device=X.device).view(1, k).expand(E, k)
 
-        weights = topk_prob.reshape(-1).float()
-        overlap_loss = self.compute_overlap_loss(
-            probs_e2t = probs_e2t,
-            topk_idx = topk_idx, 
-            k = k
-        )
-        balance_loss = self.compute_balance_loss(
-            probs_e2t=probs_e2t, 
-            topk_idx=topk_idx
-        ) 
+        if isinstance(logits, tuple):
+            # Semantic weighting renormalized over S(n) = {experts that selected token n}.
+            sem_logits = logits[1]                                # [N, E]
+            sel_sem_logit = sem_logits.gather(0, topk_idx)        # [k, E] = s_e(n) per dispatched pair
+            flat_tok = topk_idx.reshape(-1)
 
+            # Per-token max over S(n) for numerical stability (sem logits std is large/rising).
+            with torch.no_grad():
+                max_sem = torch.full(
+                    (N,), float("-inf"), device=X.device, dtype=sel_sem_logit.dtype
+                )
+                max_sem.scatter_reduce_(
+                    0, flat_tok, sel_sem_logit.reshape(-1), reduce="amax", include_self=True
+                )
+
+            num = torch.exp((sel_sem_logit - max_sem[topk_idx]) / self.sem_weight_temp)  # [k, E]
+            denom = torch.zeros(N, device=X.device, dtype=num.dtype).index_add(
+                0, flat_tok, num.reshape(-1)
+            )                                                     # denom[n] = sum_{e' in S(n)} exp(...)
+
+            weights = (num / (denom[topk_idx] + 1e-9)).transpose(0, 1).contiguous().float()  # [E, k]
+        else:
+            weights = topk_prob.transpose(0, 1).contiguous().float()
         routing_state = RoutingState(
-            token_idx=token_idx,
-            expert_idx=expert_idx, 
-            slot_idx=slot_idx,
-            weights=weights,
+            token_idx=token_idx.reshape(-1),
+            expert_idx=expert_idx.reshape(-1),
+            slot_idx=slot_idx.reshape(-1),
+            weights=weights.reshape(-1),
             num_experts=E,
             num_tokens=N,
             capacity=k
         )
 
-        return routing_state, balance_loss, overlap_loss, z_loss, logits_std, logits_temp_std, logits.detach()
+        logits_ret = logits[0] if isinstance(logits, tuple) else logits
+        return routing_state, spatial_loss, z_loss, logits_ret.detach(), logit_stats
 
-    def _uniform_routing(self, X, logits, logits_std, logits_temp_std, z_loss):
+    def _uniform_routing(self, X, logits, logit_stats, z_loss, spatial_loss):
         """
         Uniform routing (Phase 1).
-        
+
         Distributes tokens evenly across all experts without using router decisions.
         This allows experts to learn diverse features before routing specialization.
         """
@@ -258,27 +321,39 @@ class Router(nn.Module):
 
         keep = slot_idx < ccap
 
+        kept_token_idx = token_idx[keep]
+        kept_expert_idx = expert_idx[keep]
+        kept_slot_idx = slot_idx[keep]
+
+        token_table = torch.zeros(E, ccap, device=X.device, dtype=torch.long)
+        weight_table = torch.zeros(E, ccap, device=X.device, dtype=torch.float32)
+
+        flat_slot = kept_expert_idx * ccap + kept_slot_idx
+        token_table.view(-1).scatter_(0, flat_slot, kept_token_idx)
+        weight_table.view(-1).scatter_(
+            0,
+            flat_slot,
+            torch.ones_like(kept_token_idx, dtype=torch.float32),
+        )
+
+        full_expert_idx = torch.arange(E, device=X.device).view(E, 1).expand(E, ccap)
+        full_slot_idx = torch.arange(ccap, device=X.device).view(1, ccap).expand(E, ccap)
+
         routing_state = RoutingState(
-            token_idx=token_idx[keep],
-            expert_idx=expert_idx[keep],
-            slot_idx=slot_idx[keep],
-            weights=torch.full(
-                (int(keep.sum().item()),),
-                1.0,
-                device=X.device,
-                dtype=torch.float32,
-            ),
+            token_idx=token_table.reshape(-1),
+            expert_idx=full_expert_idx.reshape(-1),
+            slot_idx=full_slot_idx.reshape(-1),
+            weights=weight_table.reshape(-1),
             num_tokens=N,
             num_experts=E,
             capacity=ccap
         )
 
-        z_loss = torch.tensor(0.0, device=X.device, dtype=torch.float32)
-        overlap_loss = torch.tensor(0.0, device=X.device, dtype=torch.float32)
-        balance_loss = torch.tensor(0.0, device=X.device, dtype=torch.float32)
+        spatial_loss = X.new_tensor(0.0, dtype=torch.float32)
 
-        return routing_state, balance_loss, overlap_loss, z_loss, logits_std, logits_temp_std, logits.detach()
-    
+        logits_ret = logits[0] if isinstance(logits, tuple) else logits
+        return routing_state, spatial_loss, z_loss, logits_ret.detach(), logit_stats
+
     def z_loss(self, logits):
         """
         Computes Z-loss to encourage smaller logits.
@@ -288,109 +363,43 @@ class Router(nn.Module):
         """
 
         return torch.logsumexp(logits, dim = -1).square().mean()
-    
-    def compute_overlap_loss(
-        self, 
-        probs_e2t, 
-        topk_idx, 
-        k
-    ):
+
+    def spatial_loss(self, pos_logits, h_patches, w_patches):
         """
-        Pairwise soft overlap loss for expert-choice routing.
+        Positional specialization loss (centroidi).
+
+        Spinge gli expert su regioni spaziali separate: massimizza la distanza
+        media tra i centroidi (sulla griglia) delle distribuzioni posizione-per-expert.
 
         Args:
-            probs_e2t: router probabilities after softmax over experts.
-                    Shape [N, E]
-            topk_idx: unused here, kept for API compatibility.
-                    Shape [k, E]
-            k: unused here, kept for API compatibility.
-
-        Returns:
-            Scalar loss. Lower means less pairwise overlap between experts.
+            pos_logits (torch.Tensor): logit posizionali [B*P, E].
+            h_patches, w_patches (int): griglia delle posizioni per immagine.
         """
-        
-        """
-        Soft token coverage loss for expert-choice routing.
-        Kept under the overlap-loss slot for compatibility with the
-        training loop and existing logs.
+        N, E = pos_logits.shape
+        P = h_patches * w_patches
 
-        Args : 
-            probs_e2t : Router probabilities after softmax | Shape [N, E]
-            topk_idx : Token indices selected by each expert | Shape [k, E]
-            k : Capacity per expert
-        """
-        N, E = probs_e2t.shape
+        if P <= 1 or E <= 1 or N % P != 0:
+            return pos_logits.new_tensor(0.0)
 
-        if E <= 1 or N <= 1:
-            return probs_e2t.new_tensor(0.0)
+        B = N // P
 
-        q_e2t = probs_e2t / probs_e2t.sum(dim=0, keepdim=True).clamp_min(1e-8)
+        # [B*P, E] -> [B, P, E] -> [P, E]
+        pos_map = pos_logits.view(B, P, E).mean(dim=0)
 
-        expected_assignments = float(k) * q_e2t.sum(dim=1)
+        # distribuzione posizione-per-esperto
+        w = F.softmax(pos_map / self.router_temp, dim=0)  # [P, E]
 
-        target = probs_e2t.new_tensor(float(E * k) / float(N))
+        device = pos_logits.device
+        rows = torch.arange(h_patches, device=device, dtype=torch.float32) / max(h_patches - 1, 1)
+        cols = torch.arange(w_patches, device=device, dtype=torch.float32) / max(w_patches - 1, 1)
 
-        relative_coverage = expected_assignments / target.clamp_min(1e-8)
+        grid_r = rows[:, None].expand(h_patches, w_patches).reshape(P)
+        grid_c = cols[None, :].expand(h_patches, w_patches).reshape(P)
+        pos_2d = torch.stack([grid_r, grid_c], dim=1)  # [P, 2]
 
-        return (relative_coverage - 1.0).pow(2).mean()
-        
-    def compute_balance_loss(
-        self, 
-        probs_e2t,
-        topk_idx, 
-        min_owner_frac = 0.30,
-    ) :
+        centroids = w.transpose(0, 1) @ pos_2d  # [E, 2]
 
-        """
-        Soft owner balance loss for expert choice 
+        dists = torch.cdist(centroids, centroids, p=2.0)
+        off_diag = ~torch.eye(E, dtype=torch.bool, device=device)
 
-        Args : 
-            probs_e2t : Router probabilities after softmax | Shape [N, E]
-            topk_idx : Token indices selected by each expert | Shape [k, E]
-            target_entropy : Minimum desired normalized owner entropy 
-        """
-
-        N, E = probs_e2t.shape # Shape : [N, E]
-        device = probs_e2t.device 
-        dtype = probs_e2t.dtype
-
-        if E <= 1 or N <= 1 :
-            return probs_e2t.new_tensor(0.0)
-
-        # Build hard assignment matrix S
-        S = torch.zeros(
-            (N, E),
-            device = device, 
-            dtype=dtype,
-        ) # Shape : [N, E]
-        S.scatter_(
-            dim = 0, 
-            index=topk_idx, 
-            src = torch.ones_like(topk_idx, dtype=dtype, device = device)
-        ) # Shape : [N, E]
-
-        # Compute soft responsability among assigned experts 
-        assigned_prob = probs_e2t * S # Shape : [N, E]
-
-        # Total selected probability mass per token 
-        token_mass = assigned_prob.sum(dim = 1, keepdim=True) # Shape : [N, 1]
-        processed_mask = (S.sum(dim=1, keepdim=True) > 0).to(dtype) # Shape : [N, 1]
-
-        # For each processed token, sum_e responsability[t, e] = 1
-        responsability = assigned_prob / token_mass.clamp_min(1e-8) # Shape : [N, E]
-        responsability = responsability * processed_mask # Shape : [N, E]
-
-        # Aggregate soft owner mass per expert 
-        owner_mass = responsability.sum(dim = 0) # Shape : [E]
-
-        # Distribution over experts of soft ownership 
-        owner_dist = owner_mass / owner_mass.sum().clamp_min(1e-8) # Shape : [E]
-
-        # Penalize if ownership entropy is too low 
-        min_owner = probs_e2t.new_tensor(float(min_owner_frac) / float(E))
-
-        # Penalize only experts below the minimum floor
-        floor_violation = F.relu(min_owner - owner_dist) / min_owner.clamp_min(1e-8)
-        floor_loss = floor_violation.mean()
-
-        return floor_loss
+        return -dists[off_diag].mean()

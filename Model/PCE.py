@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import torch.nn as nn
 
@@ -10,10 +12,10 @@ from Model.Components.DownsampleResBlock import DownsampleResBlock
 from Model.Components.MoEAggregator import MoEAggregator
 from Datasets_Classes.PatchExtractor import PatchExtractor
 from Model.Components.Router.Router import Router
-from Testing.dataclass.DebuggerDataClass import RoutingDebug 
+from Testing.dataclass.DebuggerDataClass import RoutingDebug
 
 class PCENetwork(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                     num_experts,
                     layer_number,
                     patch_size,
@@ -22,15 +24,16 @@ class PCENetwork(nn.Module):
                     capacity_factor_train,
                     capacity_factor_val,
                     halo_for_patches,
-                    input_size = 224, 
+                    input_size = 224,
                     use_static_map = False,
+                    unified_router = False,
                  ):
         super().__init__()
 
         """
         Constructor of PCE Network
 
-        Args : 
+        Args :
             kernel_sz_exps (int) -> kernel size of experts
             out_cha_exps // -> out channel for convolution in experts
             num_experts // -> Number of experts per layer
@@ -47,15 +50,25 @@ class PCENetwork(nn.Module):
         self.halo_for_patches = halo_for_patches
         self.input_size = input_size
         self.use_static_map = use_static_map
+        self.unified_router = unified_router
+
+        # Mixed-precision inference: run the heavy convolutional path (stem,
+        # experts, downsample, post-block, head) in bf16 to cut latency, while
+        # the router stays in float32. Computing the routing logits/softmax in
+        # float32 is the standard MoE recommendation (Switch Transformer, ST-MoE):
+        # the softmax exponentials are numerically unstable in low precision.
+        self.amp_inference = True
+        self.amp_dtype = torch.bfloat16
 
         self.patch_extractor = PatchExtractor(patch_size)
         self.layers = nn.ModuleList()
         last_channel = self.create_layers(
             num_experts=num_experts,
             layer_number=layer_number,
-            input_size = input_size, 
-            use_static_map = use_static_map
-        )        
+            input_size = input_size,
+            use_static_map = use_static_map,
+            unified_router = unified_router
+        )
 
         self.router = Router(
             num_experts=num_experts,
@@ -75,7 +88,7 @@ class PCENetwork(nn.Module):
             nn.BatchNorm2d(64),
             nn.SiLU(inplace=True)
         )
-        
+
         num_experts_per_layer = [
             len(l.experts) if isinstance(l, PCELayer) else 0
             for l in self.layers
@@ -84,22 +97,22 @@ class PCENetwork(nn.Module):
             num_layers=len(num_experts_per_layer),
             num_experts=num_experts_per_layer,
         )
-    def create_layers(self, num_experts, layer_number, input_size, use_static_map):
+    def create_layers(self, num_experts, layer_number, input_size, use_static_map, unified_router):
         """
         Create layers of PCE Network
 
         Args:
             num_experts : Number of experts for layer l
-            layer_number : Number of ResNet Layer 
+            layer_number : Number of ResNet Layer
             input_size : Dimension of the input H x W
-            use_static_map : Set if the model use the static or dynamic routing mapping 
+            use_static_map : Set if the model use the static or dynamic routing mapping
         """
         def get_fourie_channel(F):
             return 2 + 4 * F
 
         def conv_out_size(size, kernel_size, stride, padding, dilation = 1):
             return ((size + 2 * padding - dilation * (kernel_size - 1) -  1) // stride) + 1
-        
+
         # Setting start parameters
         patch_size = self.patch_extractor.patch_size
         unfold_kernel_size = patch_size + 2 * self.halo_for_patches
@@ -121,14 +134,14 @@ class PCENetwork(nn.Module):
                 self.layers.append(
                     DownsampleResBlock(in_ch = inpt_channel, out_ch= transition_out)
                 )
-                
+
                 inpt_channel = transition_out
                 out_channel = transition_out
 
                 patch_size = max(2, patch_size // 2)
                 unfold_kernel_size = patch_size + 2 * self.halo_for_patches
 
-                # After downsample 
+                # After downsample
                 current_h = conv_out_size(current_h, kernel_size=3, stride=2, padding=1)
                 current_w = conv_out_size(current_w, kernel_size=3, stride=2, padding=1)
 
@@ -148,9 +161,10 @@ class PCENetwork(nn.Module):
                     kernel_size = 3,
                     unfold_kernel_size = unfold_kernel_size,
                     num_positions = P,
-                    use_static_map = use_static_map
+                    use_static_map = use_static_map,
+                    unified_router = unified_router,
                 ))
-                
+
         return out_channel
 
     def crop_center(self, y, patch_size):
@@ -184,8 +198,7 @@ class PCENetwork(nn.Module):
             logits (torch.tensor) : tensor beatches (B, num_classes)
         """
         tot_z_loss  = 0.0
-        tot_balance_loss = 0.0
-        tot_overlap_loss = 0.0
+        tot_spatial_loss = 0.0
 
         img_device = X.device
         B = X.shape[0]
@@ -193,10 +206,28 @@ class PCENetwork(nn.Module):
 
         moe_layers = 0
 
-        X = self.stem(X)
+        # bf16 autocast for the convolutional path only; the router runs outside
+        # of it (see below) so its logits/softmax stay in float32.
+        #
+        # In eval we drive the autocast ourselves. In training we return a no-op
+        # context instead of autocast(enabled=False): this way an *outer* autocast
+        # (e.g. PyTorch Lightning `precision='bf16-mixed'`) is left in place inside
+        # these blocks, so training can run in bf16 too. The router is forced to
+        # fp32 separately by its own autocast(enabled=False) block, which overrides
+        # any outer autocast even during training.
+        amp_enabled = self.amp_inference and (not self.training) and X.is_cuda
+
+        def amp_ctx():
+            if amp_enabled:
+                return torch.autocast(device_type="cuda", dtype=self.amp_dtype)
+            return contextlib.nullcontext()
+
+        with amp_ctx():
+            X = self.stem(X)
         for layer_idx, layer in enumerate(self.layers):
             if isinstance(layer, DownsampleResBlock):
-                X = layer(X)
+                with amp_ctx():
+                    X = layer(X)
             else :
                 moe_layers += 1
 
@@ -206,7 +237,7 @@ class PCENetwork(nn.Module):
                 merge_act = layer.activation_merge
                 post_block = layer.post_block
                 unfold_kernel_size = layer.unfold_kernel_size
-                
+
                 # Extract patches from the current feature map
                 patch_size = layer.patch_size
                 self.patch_extractor.patch_size = patch_size
@@ -214,70 +245,56 @@ class PCENetwork(nn.Module):
                 # Get token from X patches
                 h_patches, w_patches, X_patches = self.patch_extractor.get_patches(
                     image=X,
-                    unfold_kernel_size = unfold_kernel_size, 
+                    unfold_kernel_size = unfold_kernel_size,
                     halo = self.halo_for_patches
                 )
                 P, C, H, W = X_patches.shape[1:] # Shape : [B, P, C, H, W]
-                N = B*P 
+                N = B*P
 
                 X_tokens = X_patches.reshape(B * P, C, H, W)
-                
+
                 # Get positional features from fourier
                 positional_features = self.patch_extractor.get_positional(
-                    h_patches=h_patches, 
-                    w_patches=w_patches, 
-                    B=B, 
-                    img_device=img_device, 
-                )
+                    h_patches=h_patches,
+                    w_patches=w_patches,
+                    B=B,
+                    img_device=img_device,
+                ) # Shape : [B, P, FC]
                 positional_features = positional_features.flatten(0, 1)
-                
-                # Route patches to experts and compute auxiliary losses
-                routing_state, balance_loss, overlap_loss, z_loss, logits_std, logits_temp_std, logits = self.router(
-                    X_tokens, 
-                    layer.router_gate, 
-                    positional_features,
-                    num_positions=P,
-                    current_epoch = current_epoch,
-                )
+
+                # Route patches to experts and compute auxiliary losses.
+                with torch.autocast(device_type="cuda", enabled=False):
+                    routing_state, spatial_loss, z_loss, logits, logit_stats = self.router(
+                        X_tokens.float(),
+                        layer.router_gate,
+                        positional_features.float(),
+                        num_positions=P,
+                        h_patches=h_patches,
+                        w_patches=w_patches,
+                        current_epoch = current_epoch,
+                        collect_metrics=collect_routes,
+                    )
 
                 if collect_routes:
+                    valid_route = routing_state.weights > 0
                     routing_debug.append(
                         RoutingDebug(
-                            layer_idx=layer_idx, 
+                            layer_idx=layer_idx,
                             B = B,
-                            E = len(experts), 
+                            E = len(experts),
                             h_patches=h_patches,
                             w_patches=w_patches,
-                            token_idx=routing_state.token_idx.detach().cpu(),
-                            experts_idx=routing_state.expert_idx.detach().cpu(),
-                            weight = routing_state.weights.detach().cpu(),
+                            token_idx=routing_state.token_idx[valid_route].detach().cpu(),
+                            experts_idx=routing_state.expert_idx[valid_route].detach().cpu(),
+                            weight = routing_state.weights[valid_route].detach().cpu(),
                             logits = logits.detach().cpu()
                         )
                     )
 
-                token_idx = routing_state.token_idx
-                expert_idx = routing_state.expert_idx
-                weights = routing_state.weights.to(dtype = X_tokens.dtype)
-
-                order = torch.argsort(expert_idx)
-                token_idx = token_idx.index_select(0, order)
-                expert_idx = expert_idx.index_select(0, order)
-                weights = weights.index_select(0, order)
-
-                E = len(experts)
-                counts = torch.bincount(expert_idx, minlength=E)
-
-                per_exp_token_idx = [None] * E
-                per_exp_weights = [None] * E
-                offset = 0
-                for e, count in enumerate(counts.tolist()):
-                    if count == 0:
-                        continue
-                    next_offset = offset + count
-                    per_exp_token_idx[e] = token_idx[offset:next_offset]
-                    per_exp_weights[e] = weights[offset:next_offset].view(-1, 1, 1, 1)
-                    offset = next_offset
-                
+                E = int(routing_state.num_experts)
+                K = int(routing_state.capacity)
+                dispatch_token_idx = routing_state.token_idx.view(E, K)
+                dispatch_weights = routing_state.weights.view(E, K).to(dtype=X_tokens.dtype)
                 X_center = self.crop_center(X_tokens, patch_size)
                 outputs = X_center.clone()
                 rel_delta_sum = 0.0
@@ -285,102 +302,105 @@ class PCENetwork(nn.Module):
                 rel_delta_eps = 1e-8
 
                 for e, expert in enumerate(experts):
-                    n_e = per_exp_token_idx[e]
-                    if n_e is None:
-                        continue
-
+                    n_e = dispatch_token_idx[e]
                     x_e = X_tokens.index_select(0, n_e)
                     x_e_center = self.crop_center(x_e, patch_size)
 
-                    y_e = expert(x_e)
+                    with amp_ctx():
+                        y_e = expert(x_e)
                     y_e = self.crop_center(y_e, patch_size)
 
-                    w_e = per_exp_weights[e] # Shape : [k_e, 1, 1, 1]
-
                     delta_e = y_e - x_e_center
-                    with torch.no_grad():
-                        rel_delta = delta_e.detach().flatten(1).norm(dim=1) / (
-                            x_e_center.detach().flatten(1).norm(dim=1) + rel_delta_eps
-                        )
-                        rel_delta_sum += float(rel_delta.sum().item())
-                        rel_delta_count += int(rel_delta.numel())
-                    contrib = delta_e * w_e.to(dtype=y_e.dtype)
-                    outputs.index_add_(0, n_e, contrib)
+                    w_e = dispatch_weights[e].view(-1, 1, 1, 1)
+                    outputs.index_add_(0, n_e, (delta_e * w_e).to(dtype=outputs.dtype))
+
+                    if collect_routes:
+                        with torch.no_grad():
+                            valid_e = dispatch_weights[e] > 0
+                            rel_delta = delta_e.detach().flatten(1).norm(dim=1) / (
+                                x_e_center.detach().flatten(1).norm(dim=1) + rel_delta_eps
+                            )
+                            rel_delta = rel_delta[valid_e]
+                            rel_delta_sum += float(rel_delta.sum().item())
+                            rel_delta_count += int(rel_delta.numel())
 
                 # Reassemble patches back into spatial feature map
                 _, C_out, H_out, W_out = outputs.shape
 
-                with torch.no_grad():
-                    eps = 1e-8
+                if collect_routes :
+                    with torch.no_grad():
+                        eps = 1e-8
 
-                    expert_effective_delta = outputs.detach() - X_center.detach()
+                        expert_effective_delta = outputs.detach() - X_center.detach()
 
-                    expert_effective_rel_delta = (
-                        expert_effective_delta.flatten(1).norm(dim=1) / (X_center.detach().flatten(1).norm(dim=1) + eps)
-                    )
+                        expert_effective_rel_delta = (
+                            expert_effective_delta.flatten(1).norm(dim=1) / (X_center.detach().flatten(1).norm(dim=1) + eps)
+                        )
 
-                    expert_effective_rel_delta_sum = float(expert_effective_rel_delta.sum().item())
-                    expert_effective_rel_delta_count = int(expert_effective_rel_delta.numel())
+                        expert_effective_rel_delta_sum = float(expert_effective_rel_delta.sum().item())
+                        expert_effective_rel_delta_count = int(expert_effective_rel_delta.numel())
 
-                with torch.no_grad():
-                    self.moe_aggregator.update_layer(
-                        layer_idx=layer_idx,
-                        token_idx=routing_state.token_idx.detach(),
-                        num_tokens=routing_state.num_tokens,
-                        logits_std=logits_std,
-                        logits_temp_std=logits_temp_std,
-                        logits=logits.detach(),
-                        expert_idx=routing_state.expert_idx.detach(),
-                        weights=routing_state.weights.detach(),
-                        rel_delta_sum=rel_delta_sum,
-                        rel_delta_count=rel_delta_count,
-                        expert_effective_rel_delta_sum=expert_effective_rel_delta_sum,
-                        expert_effective_rel_delta_count=expert_effective_rel_delta_count,
-                    )
+                    with torch.no_grad():
+                        self.moe_aggregator.update_layer(
+                            layer_idx=layer_idx,
+                            token_idx=routing_state.token_idx[valid_route].detach(),
+                            num_tokens=routing_state.num_tokens,
+                            logit_stats=logit_stats,
+                            logits=logits.detach(),
+                            expert_idx=routing_state.expert_idx[valid_route].detach(),
+                            weights=routing_state.weights[valid_route].detach(),
+                            rel_delta_sum=rel_delta_sum,
+                            rel_delta_count=rel_delta_count,
+                            expert_effective_rel_delta_sum=expert_effective_rel_delta_sum,
+                            expert_effective_rel_delta_count=expert_effective_rel_delta_count,
+                            num_positions=P,
+                        )
 
                 X = rearrange(
-                    outputs.view(B, P, C_out, H_out, W_out), 
+                    outputs.view(B, P, C_out, H_out, W_out),
                     'b (h w) c ph pw -> b c (h ph) (w pw)',
                     h=h_patches, w=w_patches
                 )
                 X_sparse = X
 
                 # Dense and residual block
-                dens_in = merge_act(merge_gn(X))
-                dense_delta = post_block(dens_in)
+                with amp_ctx():
+                    dens_in = merge_act(merge_gn(X))
+                    dense_delta = post_block(dens_in)
                 X = X + dense_delta
 
-                with torch.no_grad():
-                    eps = 1e-8
+                if collect_routes :
+                    with torch.no_grad():
+                        eps = 1e-8
 
-                    sparse_norm = X_sparse.detach().flatten(1).norm(dim=1).mean()
-                    dense_rel_delta = (
-                        dense_delta.detach().flatten(1).norm(dim = 1).mean() / (sparse_norm + eps)
-                    )
+                        sparse_norm = X_sparse.detach().flatten(1).norm(dim=1).mean()
+                        dense_rel_delta = (
+                            dense_delta.detach().flatten(1).norm(dim = 1).mean() / (sparse_norm + eps)
+                        )
 
-                    self.moe_aggregator.update_dense_layer(
-                        layer_idx=layer_idx,
-                        dense_rel_delta=float(dense_rel_delta.item()),
-                        device=X.device,
-                    )
+                        self.moe_aggregator.update_dense_layer(
+                            layer_idx=layer_idx,
+                            dense_rel_delta=float(dense_rel_delta.item()),
+                            device=X.device,
+                        )
 
                 tot_z_loss += z_loss
-                tot_balance_loss += balance_loss
-                tot_overlap_loss += overlap_loss
+                tot_spatial_loss += spatial_loss
 
         # Apply global pooling and prediction head
-        x = self.pooler(X) 
-        x = self.flatten(x) 
-        logits = self.prediction_head(x) 
-        
-        tot_z_loss = tot_z_loss / E
-        tot_balance_loss = tot_balance_loss / E
-        tot_overlap_loss = tot_overlap_loss / E
+        with amp_ctx():
+            x = self.pooler(X)
+            x = self.flatten(x)
+            logits = self.prediction_head(x)
+        logits = logits.float()
+
+        tot_z_loss = tot_z_loss / moe_layers
+        tot_spatial_loss = tot_spatial_loss / moe_layers
 
         if collect_routes:
-            return logits, tot_balance_loss, tot_overlap_loss, tot_z_loss, routing_debug
+            return logits, tot_spatial_loss, tot_z_loss, routing_debug
 
-        return logits, tot_balance_loss, tot_overlap_loss, tot_z_loss,
+        return logits, tot_spatial_loss, tot_z_loss,
 
 
     def _indices_from_dispatch(self, dispatch):
@@ -429,7 +449,7 @@ class PCENetwork(nn.Module):
         # Compute entropy and normalize it
         if E > 1:
             p = usage_frac + 1e-12
-            p = p / p.sum() # Normalize 
+            p = p / p.sum() # Normalize
             entropy = float((-(p * p.log()).sum().item())) # Compute shannon entropy
             entropy_norm = entropy / float(torch.log(torch.tensor(float(E))).item())
 
@@ -439,7 +459,7 @@ class PCENetwork(nn.Module):
         cov_usage = float(std_u / max(1e-12, mean_u)) if E > 1 else 0.0 # Covariance of number of patches assigned to each expert
 
         # Compute capacity usage of experts
-        slot_used = dispatch.any(dim = 0) # [E, Ccap] 
+        slot_used = dispatch.any(dim = 0) # [E, Ccap]
         capacity_used = slot_used.sum(dim = 1).float() # number of slots used by each expert [E]
         capacity_ratio_per_exp = (capacity_used / max(1, Ccap)) # percentage of capacity used by each expert [E]
         mean_capacity_ratio = float(capacity_ratio_per_exp.mean().item()) # mean percentage of capacity used by each expert

@@ -17,6 +17,7 @@ class PCELayer(nn.Module):
                 unfold_kernel_size,
                 num_positions = None, 
                 use_static_map = False,
+                unified_router = False,
                 ):
         super().__init__()
         self.experts = nn.ModuleList([
@@ -42,7 +43,8 @@ class PCELayer(nn.Module):
                 fourier_channel= 2 + 4 * fourie_freq, 
                 num_experts=num_experts, 
                 patch_h=unfold_kernel_size,
-                patch_w=unfold_kernel_size
+                patch_w=unfold_kernel_size,
+                unified_router = unified_router
             )
                 
         self.patch_size = patch_size

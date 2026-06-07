@@ -80,24 +80,17 @@ class EMADiffLitModule(pl.LightningModule):
         # Training losses
         self.train_class_losses = []
         self.train_aux_losses = []
+        self.train_raw_spatial_losses = []
+        self.train_weighted_spatial_losses = []
         self.train_total_losses = []
-
-        self.train_raw_overlap_losses = []
-        self.train_raw_balance_losses = []
-        self.train_weighted_overlap_losses = []
-        self.train_weighted_balance_losses = []
-
 
         # Validation losses
         self.val_class_losses = []
         self.val_aux_losses = []
+        self.val_raw_spatial_losses = []
+        self.val_weighted_spatial_losses = []
         self.val_total_losses = []
         
-        self.val_raw_overlap_losses = []
-        self.val_raw_balance_losses = []
-        self.val_weighted_overlap_losses = []
-        self.val_weighted_balance_losses = []
-
         self.gradient_norm_router = []
         self.gradient_norm_backbone = []
         self.grad_metrics_interval = 25
@@ -113,8 +106,7 @@ class EMADiffLitModule(pl.LightningModule):
         self.cutmix_prob      = 0.3
 
         self.z_loss_weigth = 0.0
-        self.overlap_loss_weight = 0.0
-        self.balance_loss_weights = 0.0
+        self.spatial_loss_weight = 0.0
 
         # Accuracy metrics
         self.accuracy_metrics = {
@@ -139,7 +131,7 @@ class EMADiffLitModule(pl.LightningModule):
         Returns:
             Tensor: Output logits from the model.
         """
-        return self.model(x, current_epoch=self.current_epoch,)
+        return self.model(x, current_epoch=self.current_epoch, collect_routes=True)
 
     def training_step(self, batch, batch_idx):
         """
@@ -164,7 +156,7 @@ class EMADiffLitModule(pl.LightningModule):
                 # Mixup
                 data, targets_a, targets_b, lam = self._mixup_batch(data, labels)
 
-            logits, balance_loss, overlap_loss, z_loss,   = self(data)
+            logits, spatial_loss, z_loss, _  = self(data)
 
             # Loss = lam * CE(logits, y_a) + (1-lam) * CE(logits, y_b)
             class_loss = (
@@ -173,24 +165,17 @@ class EMADiffLitModule(pl.LightningModule):
             )
 
         else:
-            logits, balance_loss, overlap_loss,  z_loss,   = self(data)
+            logits, spatial_loss, z_loss, _ = self(data)
             class_loss = self.train_loss(logits, labels)
 
-        aux_loss = (
-            (overlap_loss * self.overlap_loss_weight)
-            + (balance_loss * self.balance_loss_weights)
-            + (z_loss * self.z_loss_weigth)
-        )
+        weighted_spatial_loss = spatial_loss * self.spatial_loss_weight
+        aux_loss = (z_loss * self.z_loss_weigth) + weighted_spatial_loss
         total_loss = class_loss + aux_loss
 
         self.train_class_losses.append(class_loss.item())
         self.train_aux_losses.append(aux_loss.item())
-
-        self.train_raw_balance_losses.append(balance_loss.item())
-        self.train_weighted_balance_losses.append(balance_loss.item() * self.balance_loss_weights)
-
-        self.train_raw_overlap_losses.append(overlap_loss.item())
-        self.train_weighted_overlap_losses.append(overlap_loss.item() * self.overlap_loss_weight)
+        self.train_raw_spatial_losses.append(spatial_loss.item())
+        self.train_weighted_spatial_losses.append(weighted_spatial_loss.item())
         
         self.train_total_losses.append(total_loss.item())
 
@@ -244,10 +229,8 @@ class EMADiffLitModule(pl.LightningModule):
 
         elif e >= self.router_start_epoch:
             self._unfreeze_router()
-            self.z_loss_weigth = 5e-4
-              
-            self.overlap_loss_weight = 5e-3
-            self.balance_loss_weights = 1e-3
+            self.z_loss_weigth = 1e-2
+            self.spatial_loss_weight = 1e-3
 
             self.model.router.router_temp = self.temp_scheduler()
             self.model.router.noise_std = self.noise_scheduler()
@@ -318,11 +301,9 @@ class EMADiffLitModule(pl.LightningModule):
         log_dict = {
             'training/train_class_loss' : torch.tensor(self.train_class_losses).mean().item(),
             'training/train_aux_loss' : torch.tensor(self.train_aux_losses).mean().item(),
+            'training/raw_spatial_loss' : torch.tensor(self.train_raw_spatial_losses).mean().item(),
+            'training/weighted_spatial_loss' : torch.tensor(self.train_weighted_spatial_losses).mean().item(),
             'training/train_total_loss' : torch.tensor(self.train_total_losses).mean().item(),
-            'training/raw_balance_loss' : torch.tensor(self.train_raw_balance_losses).mean().item(),
-            'training/weighted_balance_loss' : torch.tensor(self.train_weighted_balance_losses).mean().item(),
-            'training/raw_overlap_loss' : torch.tensor(self.train_raw_overlap_losses).mean().item(),
-            'training/weighted_overlap_loss' : torch.tensor(self.train_weighted_overlap_losses).mean().item(),
 
             'training/train_top1' : self.accuracy_metrics['top1_train'].compute().item() * 100,
             'training/train_top5' : self.accuracy_metrics['top5_train'].compute().item() * 100,
@@ -335,15 +316,11 @@ class EMADiffLitModule(pl.LightningModule):
 
         self.train_class_losses.clear()
         self.train_aux_losses.clear()
+        self.train_raw_spatial_losses.clear()
+        self.train_weighted_spatial_losses.clear()
         self.train_total_losses.clear()
         self.train_class_losses.clear()
         self.train_aux_losses.clear()
-
-        self.train_raw_balance_losses.clear()
-        self.train_weighted_balance_losses.clear()
-
-        self.train_raw_overlap_losses.clear()
-        self.train_weighted_overlap_losses.clear()
         
         self.gradient_norm_router.clear()
         self.gradient_norm_backbone.clear()
@@ -366,26 +343,18 @@ class EMADiffLitModule(pl.LightningModule):
         data, labels = batch
         data, labels = data.to(self.device), labels.to(self.device)
 
-        logits, balance_loss, overlap_loss, z_loss,   = self(data)
+        logits, spatial_loss, z_loss, _ = self(data)
 
         class_loss = self.val_loss(logits, labels)
 
-        aux_loss = (
-            (overlap_loss * self.overlap_loss_weight)
-            + (balance_loss * self.balance_loss_weights)
-            + (z_loss * self.z_loss_weigth)
-        )
+        weighted_spatial_loss = spatial_loss * self.spatial_loss_weight
+        aux_loss = ((z_loss * self.z_loss_weigth) + weighted_spatial_loss)
         total_loss = class_loss + aux_loss
 
         self.val_class_losses.append(class_loss.item())
         self.val_aux_losses.append(aux_loss.item())
-
-        self.val_raw_balance_losses.append(balance_loss.item())
-        self.val_weighted_balance_losses.append(balance_loss.item() * self.balance_loss_weights)
-
-        self.val_raw_overlap_losses.append(overlap_loss.item())
-        self.val_weighted_overlap_losses.append(overlap_loss.item() * self.overlap_loss_weight)
-        
+        self.val_raw_spatial_losses.append(spatial_loss.item())
+        self.val_weighted_spatial_losses.append(weighted_spatial_loss.item())
         self.val_total_losses.append(total_loss.item())
 
         if self.num_classes >= 5:
@@ -412,10 +381,8 @@ class EMADiffLitModule(pl.LightningModule):
         log_dict = {
             'validation/val_class_loss' : torch.tensor(self.val_class_losses).mean().item(),
             'validation/val_aux_loss' : torch.tensor(self.val_aux_losses).mean().item(),
-            'validation/raw_balance_loss' : torch.tensor(self.val_raw_balance_losses).mean().item(),
-            'validation/weighted_balance_loss' : torch.tensor(self.val_weighted_balance_losses).mean().item(),
-            'validation/raw_overlap_loss' : torch.tensor(self.val_raw_overlap_losses).mean().item(),
-            'validation/weighted_overlap_loss' : torch.tensor(self.val_weighted_overlap_losses).mean().item(),
+            'validation/raw_spatial_loss' : torch.tensor(self.val_raw_spatial_losses).mean().item(),
+            'validation/weighted_spatial_loss' : torch.tensor(self.val_weighted_spatial_losses).mean().item(),
             'validation/val_total_loss' : torch.tensor(self.val_total_losses).mean().item(),
             'validation/val_top1' : self.accuracy_metrics['top1_val'].compute().item() * 100,
             'validation/val_top5' : self.accuracy_metrics['top5_val'].compute().item() * 100,
@@ -423,11 +390,8 @@ class EMADiffLitModule(pl.LightningModule):
 
         self.val_class_losses.clear()
         self.val_aux_losses.clear()
-        self.val_raw_balance_losses.clear()
-        self.val_weighted_balance_losses.clear()
-
-        self.val_raw_overlap_losses.clear()
-        self.val_weighted_overlap_losses.clear()
+        self.val_raw_spatial_losses.clear()
+        self.val_weighted_spatial_losses.clear()
         self.val_total_losses.clear()
 
         log_dict.update(self._collect_router_metrics('router-val'))
@@ -451,23 +415,27 @@ class EMADiffLitModule(pl.LightningModule):
 
         backbone_params, backbone_norm = [], []
         router_params = []
+        router_pos_params = []
 
         for n, p in self.model.named_parameters():
-            is_router = ('router_gate' in n) or ('router' in n) or ('gate' in n)
+            is_router   = ('router_gate' in n) or ('router' in n) or ('gate' in n)
+            is_position = ('position_w' in n) or ('position_scale' in n)
 
-            if  n.endswith('.bias') or 'norm' in n.lower() or 'bn' in n.lower():
+            if is_router and is_position:
+                router_pos_params.append(p)
+            elif n.endswith('.bias') or 'norm' in n.lower() or 'bn' in n.lower():
                 if is_router:
                     router_params.append(p)
                 else:
                     backbone_norm.append(p)
             else:
-                if is_router :
+                if is_router:
                     router_params.append(p)
                 else:
                     backbone_params.append(p)
 
         self.backbone_params = backbone_params + backbone_norm
-        self.router_params = router_params
+        self.router_params = router_params + router_pos_params
 
         base_lr = self.lr
         router_lr = self.router_lr
@@ -518,12 +486,14 @@ class EMADiffLitModule(pl.LightningModule):
                 {'params': backbone_params, 'lr': base_lr, 'weight_decay': wd, 'name' : 'backbone'}, # Conv and Linear
                 {'params' : backbone_norm, 'lr': base_lr, 'weight_decay': 0, 'name' : 'backbone_norm'},
                 {'params': router_params, 'lr': router_lr, 'weight_decay': 0, 'name' : 'router_w'},
+                {'params': router_pos_params, 'lr': router_lr * 4,  'weight_decay': 0,  'name': 'router_position'},
             ], betas=(0.9, 0.98), eps=1e-8
         )
 
         self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[
             backbone_lr_lambda,
             backbone_lr_lambda,
+            router_lr_lambda,
             router_lr_lambda
         ])
 

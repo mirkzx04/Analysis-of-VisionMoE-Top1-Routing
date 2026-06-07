@@ -21,7 +21,7 @@ class ConvExpert(nn.Module):
         self.out_channel = out_channel
         self.hidden_size = out_channel * 1
         self.kernel_size = kernel_size
-        self.final_act = nn.SiLU(inplace=True)
+        self.final_act = nn.SiLU(inplace=False)
 
         padding = kernel_size // 2
         stride = 1
@@ -45,7 +45,7 @@ class ConvExpert(nn.Module):
                 bias=False
             ),
             nn.GroupNorm(num_groups=min(8, self.hidden_size), num_channels=self.hidden_size),
-            nn.SiLU(inplace=True),
+            nn.SiLU(inplace=False),
             self.last_conv,
             nn.GroupNorm(num_groups=min(8, out_channel), num_channels=out_channel),
         )

@@ -46,9 +46,20 @@ class MoEAggregator:
         self.logits_std_count_layers = [0 for _ in range(num_layers)]
         self.logits_temp_std_sum_layers = [0.0 for _ in range(num_layers)]
         self.logits_temp_std_count_layers = [0 for _ in range(num_layers)]
+        self.logits_std_pos_sum_layers = [0.0 for _ in range(num_layers)]
+        self.logits_std_pos_count_layers = [0 for _ in range(num_layers)]
+        self.logits_std_sem_sum_layers = [0.0 for _ in range(num_layers)]
+        self.logits_std_sem_count_layers = [0 for _ in range(num_layers)]
+        self.logits_temp_std_pos_sum_layers = [0.0 for _ in range(num_layers)]
+        self.logits_temp_std_pos_count_layers = [0 for _ in range(num_layers)]
+        self.logits_temp_std_sem_sum_layers = [0.0 for _ in range(num_layers)]
+        self.logits_temp_std_sem_count_layers = [0 for _ in range(num_layers)]
 
         self.token_logit_entropy_sum_layers = [0.0 for _ in range(num_layers)]
         self.token_logit_entropy_count_layers = [0 for _ in range(num_layers)]
+
+        # Per-layer expert x position joint counts (lazily allocated to [E, P]).
+        self.expert_pos_joint_layers = [None for _ in range(num_layers)]
 
     @staticmethod
     def _mmm(values):
@@ -64,6 +75,45 @@ class MoEAggregator:
         else:
             return 0.0, 0.0, 0.0
         return float(t.mean().item()), float(t.max().item()), float(t.min().item())
+
+    @staticmethod
+    def _mutual_information(joint):
+        """MI in nats between two discrete variables from a joint count matrix."""
+        total = joint.sum()
+        if float(total.item()) <= 0.0:
+            return 0.0
+        p = joint / total
+        p_row = p.sum(dim=1, keepdim=True)
+        p_col = p.sum(dim=0, keepdim=True)
+        nz = p > 0
+        ratio = p[nz] / (p_row.expand_as(p)[nz] * p_col.expand_as(p)[nz])
+        return float((p[nz] * ratio.log()).sum().item())
+
+    @staticmethod
+    def _expert_pos_entropies(joint):
+        """
+        Normalized marginal/conditional entropies from an [E, P] joint count matrix,
+        both in [0, 1] (divided by log E). Computed on the HARD dispatch, so non
+        sem-confused:
+            H(e)      -> bilanciamento uso expert (alto = bilanciato)
+            H(e|pos)  -> specializzazione per posizione (basso = confident)
+        Nota: MI_norm = H(e)_norm - H(e|pos)_norm.
+        Returns (marg_norm, cond_norm).
+        """
+        total = joint.sum()
+        E = joint.shape[0]
+        if float(total.item()) <= 0.0 or E <= 1:
+            return 0.0, 0.0
+        log_e = math.log(E)
+        p = joint / total                                  # p(e, pos)
+        p_e = p.sum(dim=1)                                  # p(e)   [E]
+        p_pos = p.sum(dim=0)                                # p(pos) [P]
+        nz_e = p_e > 0
+        h_marg = float(-(p_e[nz_e] * p_e[nz_e].log()).sum().item())
+        q = p / p_pos.clamp_min(1e-12).unsqueeze(0)        # p(e|pos)
+        nz = p > 0
+        h_cond = float(-(p[nz] * q[nz].log()).sum().item())  # H(e|pos)
+        return h_marg / log_e, h_cond / log_e
 
     @staticmethod
     def _ddp_allreduce_(tensor: torch.Tensor):
@@ -103,15 +153,15 @@ class MoEAggregator:
         layer_idx: int,
         token_idx: torch.Tensor,
         num_tokens: int,
-        logits_std: float | None,
-        logits_temp_std: float | None,
-        logits: torch.Tensor | None,
+        logit_stats: dict[str, float | None] | None = None,
+        logits: torch.Tensor | None = None,
         expert_idx: torch.Tensor | None = None,
         weights: torch.Tensor | None = None,
         rel_delta_sum: float | None = None,
         rel_delta_count: int = 0,
         expert_effective_rel_delta_sum: float | None = None,
         expert_effective_rel_delta_count: int = 0,
+        num_positions: int | None = None,
     ):
         """
         Update accumulators for a single MoE layer on the current batch.
@@ -121,8 +171,7 @@ class MoEAggregator:
             token_idx: flattened token ids selected by the router, with repetitions
                 when one token is assigned to multiple experts.
             num_tokens: total number of tokens before routing.
-            logits_std: std of router raw logits, used to track sharpness.
-            logits_temp_std: std of temperature-scaled logits, closer to dispatch sharpness.
+            logit_stats: router logit statistics emitted by Router.forward.
             logits: router logits [N, E], used to compute the legacy
                 `token_logit_entropy_mean` metric on the expert->token axis.
         """
@@ -156,13 +205,37 @@ class MoEAggregator:
         self.multi_count_layers[layer_idx] += multi.sum().to(torch.float64)
         self.assignment_sum_layers[layer_idx] += assign.sum()
 
+        logit_stats = logit_stats or {}
+
+        logits_std = logit_stats.get("logits_std")
         if logits_std is not None:
             self.logits_std_sum_layers[layer_idx] += float(logits_std)
             self.logits_std_count_layers[layer_idx] += 1
 
+        logits_temp_std = logit_stats.get("logits_temp_std")
         if logits_temp_std is not None:
             self.logits_temp_std_sum_layers[layer_idx] += float(logits_temp_std)
             self.logits_temp_std_count_layers[layer_idx] += 1
+
+        logits_std_pos = logit_stats.get("logits_std_pos")
+        if logits_std_pos is not None:
+            self.logits_std_pos_sum_layers[layer_idx] += float(logits_std_pos)
+            self.logits_std_pos_count_layers[layer_idx] += 1
+
+        logits_std_sem = logit_stats.get("logits_std_sem")
+        if logits_std_sem is not None:
+            self.logits_std_sem_sum_layers[layer_idx] += float(logits_std_sem)
+            self.logits_std_sem_count_layers[layer_idx] += 1
+
+        logits_temp_std_pos = logit_stats.get("logits_temp_std_pos")
+        if logits_temp_std_pos is not None:
+            self.logits_temp_std_pos_sum_layers[layer_idx] += float(logits_temp_std_pos)
+            self.logits_temp_std_pos_count_layers[layer_idx] += 1
+
+        logits_temp_std_sem = logit_stats.get("logits_temp_std_sem")
+        if logits_temp_std_sem is not None:
+            self.logits_temp_std_sem_sum_layers[layer_idx] += float(logits_temp_std_sem)
+            self.logits_temp_std_sem_count_layers[layer_idx] += 1
 
         if logits is not None:
             probs = torch.softmax(logits.detach().to(torch.float32), dim=0)
@@ -218,6 +291,19 @@ class MoEAggregator:
                     weights_owner[is_owner],
                 )
 
+        # Expert x position joint counts (position = token_idx % num_positions).
+        if num_positions is not None and expert_idx is not None and token_idx.numel() > 0:
+            E = int(self.num_experts[layer_idx])
+            P = int(num_positions)
+            if self.expert_pos_joint_layers[layer_idx] is None:
+                self.expert_pos_joint_layers[layer_idx] = torch.zeros(E, P, dtype=torch.float64, device=device)
+            expert_long = expert_idx.detach().to(device=device, dtype=torch.long)
+            pos = token_idx.to(device=device, dtype=torch.long) % P
+            flat = expert_long * P + pos
+            self.expert_pos_joint_layers[layer_idx].view(-1).index_add_(
+                0, flat, torch.ones_like(flat, dtype=torch.float64)
+            )
+
     @torch.no_grad()
     def update_dense_layer(
         self,
@@ -260,12 +346,20 @@ class MoEAggregator:
         ]:
             self._ddp_allreduce_(t)
 
+        for t in self.expert_pos_joint_layers:
+            if t is not None:
+                self._ddp_allreduce_(t)
+
         moe_layer_ids = [i for i, E in enumerate(self.num_experts) if E > 0]
 
         multi_rate_layers = []
         experts_per_processed_token_layers = []
         logits_std_layers = []
         logits_temp_std_layers = []
+        logits_std_pos_layers = []
+        logits_std_sem_layers = []
+        logits_temp_std_pos_layers = []
+        logits_temp_std_sem_layers = []
         token_logit_entropy_layers = []
         non_owner_mass_frac_layers = []
         owner_entropy_norm_layers = []
@@ -273,6 +367,9 @@ class MoEAggregator:
         expert_effective_rel_delta_layers = []
         dense_rel_delta_layers = []
         dense_to_expert_ratio_layers = []
+        mi_expert_pos_layers = []
+        marg_entropy_expert_layers = []
+        cond_entropy_expert_pos_layers = []
 
         total_tokens = 0.0
         total_processed = 0.0
@@ -317,6 +414,42 @@ class MoEAggregator:
                 logits_temp_std_layers.append(float(avg_temp_std))
             else:
                 logits_temp_std_layers.append(0.0)
+
+            if self.logits_std_pos_count_layers[layer_idx] > 0:
+                avg_std_pos = (
+                    self.logits_std_pos_sum_layers[layer_idx]
+                    / self.logits_std_pos_count_layers[layer_idx]
+                )
+                logits_std_pos_layers.append(float(avg_std_pos))
+            else:
+                logits_std_pos_layers.append(0.0)
+
+            if self.logits_std_sem_count_layers[layer_idx] > 0:
+                avg_std_sem = (
+                    self.logits_std_sem_sum_layers[layer_idx]
+                    / self.logits_std_sem_count_layers[layer_idx]
+                )
+                logits_std_sem_layers.append(float(avg_std_sem))
+            else:
+                logits_std_sem_layers.append(0.0)
+
+            if self.logits_temp_std_pos_count_layers[layer_idx] > 0:
+                avg_temp_std_pos = (
+                    self.logits_temp_std_pos_sum_layers[layer_idx]
+                    / self.logits_temp_std_pos_count_layers[layer_idx]
+                )
+                logits_temp_std_pos_layers.append(float(avg_temp_std_pos))
+            else:
+                logits_temp_std_pos_layers.append(0.0)
+
+            if self.logits_temp_std_sem_count_layers[layer_idx] > 0:
+                avg_temp_std_sem = (
+                    self.logits_temp_std_sem_sum_layers[layer_idx]
+                    / self.logits_temp_std_sem_count_layers[layer_idx]
+                )
+                logits_temp_std_sem_layers.append(float(avg_temp_std_sem))
+            else:
+                logits_temp_std_sem_layers.append(0.0)
 
             if self.token_logit_entropy_count_layers[layer_idx] > 0:
                 avg_ent = (
@@ -363,6 +496,17 @@ class MoEAggregator:
                 dense_rel_delta = 0.0   
             dense_rel_delta_layers.append(dense_rel_delta)
             dense_to_expert_ratio_layers.append(dense_rel_delta / max(1e-8, expert_effective_rel_delta))
+
+            pos_joint = self.expert_pos_joint_layers[layer_idx]
+            if pos_joint is not None:
+                mi_expert_pos_layers.append(self._mutual_information(pos_joint))
+                marg_norm, cond_norm = self._expert_pos_entropies(pos_joint)
+                marg_entropy_expert_layers.append(marg_norm)
+                cond_entropy_expert_pos_layers.append(cond_norm)
+            else:
+                mi_expert_pos_layers.append(0.0)
+                marg_entropy_expert_layers.append(0.0)
+                cond_entropy_expert_pos_layers.append(0.0)
                 
 
         drop_rate = 1.0 - (total_processed / max(1.0, total_tokens))
@@ -370,6 +514,10 @@ class MoEAggregator:
         experts_per_processed_token_mean, _, _ = self._mmm(experts_per_processed_token_layers)
         logits_std_mean, _, _ = self._mmm(logits_std_layers)
         logits_temp_std_mean, _, _ = self._mmm(logits_temp_std_layers)
+        logits_std_pos_mean, _, _ = self._mmm(logits_std_pos_layers)
+        logits_std_sem_mean, _, _ = self._mmm(logits_std_sem_layers)
+        logits_temp_std_pos_mean, _, _ = self._mmm(logits_temp_std_pos_layers)
+        logits_temp_std_sem_mean, _, _ = self._mmm(logits_temp_std_sem_layers)
         token_logit_entropy_mean, _, _ = self._mmm(token_logit_entropy_layers)
         non_owner_mass_frac, _, _ = self._mmm(non_owner_mass_frac_layers)
         owner_entropy_norm, _, _ = self._mmm(owner_entropy_norm_layers)
@@ -377,6 +525,9 @@ class MoEAggregator:
         expert_effective_rel_delta_mean, _, _ = self._mmm(expert_effective_rel_delta_layers)
         dense_rel_delta_mean, _, _ = self._mmm(dense_rel_delta_layers)
         dense_to_expert_ratio_mean, _, _ = self._mmm(dense_to_expert_ratio_layers)
+        mi_expert_position_mean, _, _ = self._mmm(mi_expert_pos_layers)
+        marg_entropy_expert_mean, _, _ = self._mmm(marg_entropy_expert_layers)
+        cond_entropy_expert_pos_mean, _, _ = self._mmm(cond_entropy_expert_pos_layers)
 
         metrics = {
             "drop_rate": drop_rate,
@@ -385,12 +536,19 @@ class MoEAggregator:
             "token_logit_entropy_mean": token_logit_entropy_mean,
             "logits_std_mean": logits_std_mean,
             "logits_temp_std_mean": logits_temp_std_mean,
+            "logits_std_pos_mean": logits_std_pos_mean,
+            "logits_std_sem_mean": logits_std_sem_mean,
+            "logits_temp_std_pos_mean": logits_temp_std_pos_mean,
+            "logits_temp_std_sem_mean": logits_temp_std_sem_mean,
             "non_owner_mass_frac": non_owner_mass_frac,
             "owner_entropy_norm": owner_entropy_norm,
             "expert_raw_rel_delta_mean": expert_raw_rel_delta_mean,
             "expert_effective_rel_delta_mean": expert_effective_rel_delta_mean,
             "dense_rel_delta_mean": dense_rel_delta_mean,
             "dense_to_expert_ratio_mean": dense_to_expert_ratio_mean,
+            "mi_expert_position": mi_expert_position_mean,
+            "marg_entropy_expert": marg_entropy_expert_mean,
+            "cond_entropy_expert_pos": cond_entropy_expert_pos_mean,
         }
         if include_layer_detail_metrics:
             for moe_layer_idx in range(len(expert_raw_rel_delta_layers)):
@@ -400,6 +558,18 @@ class MoEAggregator:
                 )
                 metrics[f"moe_layer_{moe_layer_idx}/owner_entropy_norm"] = float(
                     owner_entropy_norm_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/logits_std_pos"] = float(
+                    logits_std_pos_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/logits_std_sem"] = float(
+                    logits_std_sem_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/logits_temp_std_pos"] = float(
+                    logits_temp_std_pos_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/logits_temp_std_sem"] = float(
+                    logits_temp_std_sem_layers[moe_layer_idx]
                 )
                 metrics[f"moe_layer_{moe_layer_idx}/expert_raw_rel_delta"] = float(
                     expert_raw_rel_delta_layers[moe_layer_idx]
@@ -412,6 +582,15 @@ class MoEAggregator:
                 )
                 metrics[f"moe_layer_{moe_layer_idx}/dense_to_expert_ratio"] = float(
                     dense_to_expert_ratio_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/mi_expert_position"] = float(
+                    mi_expert_pos_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/marg_entropy_expert"] = float(
+                    marg_entropy_expert_layers[moe_layer_idx]
+                )
+                metrics[f"moe_layer_{moe_layer_idx}/cond_entropy_expert_pos"] = float(
+                    cond_entropy_expert_pos_layers[moe_layer_idx]
                 )
         return metrics
 
@@ -474,6 +653,16 @@ class MoEAggregator:
         self.logits_std_count_layers = [0 for _ in range(self.num_layers)]
         self.logits_temp_std_sum_layers = [0.0 for _ in range(self.num_layers)]
         self.logits_temp_std_count_layers = [0 for _ in range(self.num_layers)]
+        self.logits_std_pos_sum_layers = [0.0 for _ in range(self.num_layers)]
+        self.logits_std_pos_count_layers = [0 for _ in range(self.num_layers)]
+        self.logits_std_sem_sum_layers = [0.0 for _ in range(self.num_layers)]
+        self.logits_std_sem_count_layers = [0 for _ in range(self.num_layers)]
+        self.logits_temp_std_pos_sum_layers = [0.0 for _ in range(self.num_layers)]
+        self.logits_temp_std_pos_count_layers = [0 for _ in range(self.num_layers)]
+        self.logits_temp_std_sem_sum_layers = [0.0 for _ in range(self.num_layers)]
+        self.logits_temp_std_sem_count_layers = [0 for _ in range(self.num_layers)]
 
         self.token_logit_entropy_sum_layers = [0.0 for _ in range(self.num_layers)]
         self.token_logit_entropy_count_layers = [0 for _ in range(self.num_layers)]
+
+        self.expert_pos_joint_layers = [None for _ in range(self.num_layers)]
