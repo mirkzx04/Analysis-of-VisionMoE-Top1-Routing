@@ -2,6 +2,7 @@ import contextlib
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from einops import rearrange
 
@@ -27,6 +28,8 @@ class PCENetwork(nn.Module):
                     input_size = 224,
                     use_static_map = False,
                     unified_router = False,
+                    task = "seg",
+                    uniform_epochs = 10
                  ):
         super().__init__()
 
@@ -51,12 +54,9 @@ class PCENetwork(nn.Module):
         self.input_size = input_size
         self.use_static_map = use_static_map
         self.unified_router = unified_router
+        self.task = task
 
-        # Mixed-precision inference: run the heavy convolutional path (stem,
-        # experts, downsample, post-block, head) in bf16 to cut latency, while
-        # the router stays in float32. Computing the routing logits/softmax in
-        # float32 is the standard MoE recommendation (Switch Transformer, ST-MoE):
-        # the softmax exponentials are numerically unstable in low precision.
+        # Mixed-precision inference
         self.amp_inference = True
         self.amp_dtype = torch.bfloat16
 
@@ -76,13 +76,27 @@ class PCENetwork(nn.Module):
             router_temp = router_temp,
             capacity_factor_train=capacity_factor_train,
             capacity_factor_eval=capacity_factor_val,
+            uniform_epochs=uniform_epochs,
         )
 
-        self.pooler = nn.AdaptiveAvgPool2d(1)
-        self.flatten = nn.Flatten()
-        self.prediction_head = nn.Sequential(
-            nn.Linear(last_channel, num_classes),
-        )
+        if task == "class" : 
+            self.pooler = nn.AdaptiveAvgPool2d(1)
+            self.flatten = nn.Flatten()
+            self.prediction_head = nn.Sequential(
+                nn.Linear(last_channel, num_classes),
+            )
+        if task == "seg" :
+            self.prediction_head = nn.Sequential(
+                nn.Conv2d(last_channel, last_channel // 2, kernel_size= 3 , padding= 1, bias=False),
+                nn.BatchNorm2d(last_channel // 2),
+                nn.SiLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Conv2d(last_channel // 2, last_channel // 4, kernel_size= 3, padding= 1, bias= False),
+                nn.BatchNorm2d(last_channel // 4),
+                nn.SiLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Conv2d(last_channel // 4, num_classes, kernel_size=1)
+            )
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=7, stride=2, bias=False, padding=3),
             nn.BatchNorm2d(64),
@@ -173,7 +187,7 @@ class PCENetwork(nn.Module):
             return y
         return y[:, :, h:h + patch_size, h:h + patch_size]
 
-    def forward(self, X, current_epoch=None, collect_routes = False):
+    def forward(self, X, current_epoch=None, collect_routes = False, collect_debug = None):
         """
         Forward method of PCE Network
 
@@ -202,19 +216,17 @@ class PCENetwork(nn.Module):
 
         img_device = X.device
         B = X.shape[0]
+        in_hw = X.shape[-2:]
         routing_debug = []
+
+        # collect_debug controls only the (expensive) host-side routing dump used by
+        # offline analysis
+        if collect_debug is None:
+            collect_debug = collect_routes
 
         moe_layers = 0
 
-        # bf16 autocast for the convolutional path only; the router runs outside
-        # of it (see below) so its logits/softmax stay in float32.
-        #
-        # In eval we drive the autocast ourselves. In training we return a no-op
-        # context instead of autocast(enabled=False): this way an *outer* autocast
-        # (e.g. PyTorch Lightning `precision='bf16-mixed'`) is left in place inside
-        # these blocks, so training can run in bf16 too. The router is forced to
-        # fp32 separately by its own autocast(enabled=False) block, which overrides
-        # any outer autocast even during training.
+        # bf16 autocast for the convolutional path only
         amp_enabled = self.amp_inference and (not self.training) and X.is_cuda
 
         def amp_ctx():
@@ -277,19 +289,26 @@ class PCENetwork(nn.Module):
 
                 if collect_routes:
                     valid_route = routing_state.weights > 0
-                    routing_debug.append(
-                        RoutingDebug(
-                            layer_idx=layer_idx,
-                            B = B,
-                            E = len(experts),
-                            h_patches=h_patches,
-                            w_patches=w_patches,
-                            token_idx=routing_state.token_idx[valid_route].detach().cpu(),
-                            experts_idx=routing_state.expert_idx[valid_route].detach().cpu(),
-                            weight = routing_state.weights[valid_route].detach().cpu(),
-                            logits = logits.detach().cpu()
+                    if collect_debug:
+                        with torch.no_grad():
+                            _gate_out = layer.router_gate(X_tokens.float(), positional_features.float())
+                            _sem_logits = _gate_out[0].detach().cpu() if isinstance(_gate_out, tuple) else None
+                            _patch_var = X_tokens.detach().float().var(dim=[1, 2, 3]).cpu()
+                        routing_debug.append(
+                            RoutingDebug(
+                                layer_idx=layer_idx,
+                                B = B,
+                                E = len(experts),
+                                h_patches=h_patches,
+                                w_patches=w_patches,
+                                token_idx=routing_state.token_idx[valid_route].detach().cpu(),
+                                experts_idx=routing_state.expert_idx[valid_route].detach().cpu(),
+                                weight = routing_state.weights[valid_route].detach().cpu(),
+                                logits = logits.detach().cpu(),
+                                sem_logits = _sem_logits,
+                                patch_var = _patch_var,
+                            )
                         )
-                    )
 
                 E = int(routing_state.num_experts)
                 K = int(routing_state.capacity)
@@ -297,8 +316,8 @@ class PCENetwork(nn.Module):
                 dispatch_weights = routing_state.weights.view(E, K).to(dtype=X_tokens.dtype)
                 X_center = self.crop_center(X_tokens, patch_size)
                 outputs = X_center.clone()
-                rel_delta_sum = 0.0
-                rel_delta_count = 0
+                rel_delta_sum = None
+                rel_delta_count = None
                 rel_delta_eps = 1e-8
 
                 for e, expert in enumerate(experts):
@@ -320,9 +339,21 @@ class PCENetwork(nn.Module):
                             rel_delta = delta_e.detach().flatten(1).norm(dim=1) / (
                                 x_e_center.detach().flatten(1).norm(dim=1) + rel_delta_eps
                             )
-                            rel_delta = rel_delta[valid_e]
-                            rel_delta_sum += float(rel_delta.sum().item())
-                            rel_delta_count += int(rel_delta.numel())
+                            # Keep the reduction on-device (mask instead of boolean
+                            # index + .item()) so no GPU->CPU sync happens per expert;
+                            # masked-out entries are exact zeros and change neither
+                            # the sum nor the count.
+                            rel_delta = torch.where(valid_e, rel_delta, torch.zeros_like(rel_delta))
+                            batch_rel_delta_sum = rel_delta.sum()
+                            batch_rel_delta_count = valid_e.sum()
+                            rel_delta_sum = (
+                                batch_rel_delta_sum if rel_delta_sum is None
+                                else rel_delta_sum + batch_rel_delta_sum
+                            )
+                            rel_delta_count = (
+                                batch_rel_delta_count if rel_delta_count is None
+                                else rel_delta_count + batch_rel_delta_count
+                            )
 
                 # Reassemble patches back into spatial feature map
                 _, C_out, H_out, W_out = outputs.shape
@@ -337,7 +368,7 @@ class PCENetwork(nn.Module):
                             expert_effective_delta.flatten(1).norm(dim=1) / (X_center.detach().flatten(1).norm(dim=1) + eps)
                         )
 
-                        expert_effective_rel_delta_sum = float(expert_effective_rel_delta.sum().item())
+                        expert_effective_rel_delta_sum = expert_effective_rel_delta.sum()
                         expert_effective_rel_delta_count = int(expert_effective_rel_delta.numel())
 
                     with torch.no_grad():
@@ -380,7 +411,7 @@ class PCENetwork(nn.Module):
 
                         self.moe_aggregator.update_dense_layer(
                             layer_idx=layer_idx,
-                            dense_rel_delta=float(dense_rel_delta.item()),
+                            dense_rel_delta=dense_rel_delta,
                             device=X.device,
                         )
 
@@ -389,9 +420,14 @@ class PCENetwork(nn.Module):
 
         # Apply global pooling and prediction head
         with amp_ctx():
-            x = self.pooler(X)
-            x = self.flatten(x)
-            logits = self.prediction_head(x)
+            if self.task == "class" :
+                x = self.pooler(X)
+                x = self.flatten(x)
+                logits = self.prediction_head(x)
+            elif self.task == "seg" :
+                logits = self.prediction_head(X)
+                logits = F.interpolate(logits, size = in_hw, mode="bilinear", align_corners = False)
+
         logits = logits.float()
 
         tot_z_loss = tot_z_loss / moe_layers

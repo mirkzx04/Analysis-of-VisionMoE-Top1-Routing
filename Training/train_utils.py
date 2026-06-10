@@ -56,7 +56,7 @@ def collect_model_prameters(model, collect_head = False):
         return backbone, router, head_params
     return backbone, router
 
-def collect_router_metrics(self, prefix, model) : 
+def collect_router_metrics(prefix, model) :
     with torch.no_grad():
         router_metrics = model.moe_aggregator.finalize(include_layer_detail_metrics=False)
 

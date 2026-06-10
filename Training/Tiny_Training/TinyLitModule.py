@@ -19,7 +19,7 @@ import torch.nn as nn
 
 from Model.Components.DownsampleResBlock import DownsampleResBlock
 from schedulers import temp_scheduler, noise_scheduler, backbone_lr_lambda, router_lr_lambda
-from utils import collect_model_prameters, collect_router_metrics, clip_gradients
+from train_utils import collect_model_prameters, collect_router_metrics, clip_gradients
 
 class TinyLitModule(pl.LightningModule):
     def __init__(
@@ -271,7 +271,7 @@ class TinyLitModule(pl.LightningModule):
             'training/train_top1' : self.accuracy_metrics['top1_train'].compute().item() * 100,
             'training/train_top5' : self.accuracy_metrics['top5_train'].compute().item() * 100,
             'LR_backbone : ' : self.optimizer.param_groups[0]['lr'],
-            'LR_Router' : self.optimizer.param_groups[2]['lr'],
+            'LR_Router' : self.optimizer.param_groups[1]['lr'],
             'Gradient norm backbone' : self._mean_float(self.gradient_norm_backbone),
             'Gradient norm router' : self._mean_float(self.gradient_norm_router),
             'temp_logits' : torch.tensor(self.model.router.router_temp),
@@ -288,7 +288,7 @@ class TinyLitModule(pl.LightningModule):
         self.gradient_norm_router.clear()
         self.gradient_norm_backbone.clear()
 
-        log_dict.update(collect_router_metrics('router-train'))
+        log_dict.update(collect_router_metrics('router-train', self.model))
 
         self.log_dict(log_dict, prog_bar=True, logger=True, on_step=False, on_epoch=True)
 
@@ -359,7 +359,7 @@ class TinyLitModule(pl.LightningModule):
         self.val_weighted_spatial_losses.clear()
         self.val_total_losses.clear()
 
-        log_dict.update(collect_router_metrics('router-val'))
+        log_dict.update(collect_router_metrics('router-val', self.model))
 
         self.log_dict(log_dict, prog_bar=True, logger=True, on_step=False, on_epoch=True)
 
@@ -367,29 +367,20 @@ class TinyLitModule(pl.LightningModule):
 
         self.backbone_params, self.router_params = collect_model_prameters(self.model)
 
-        base_lr = self.lr
-        router_lr = self.router_lr
-        wd = self.weight_decay
+        # LambdaLR vuole callable(epoch) -> moltiplicatore del base_lr del gruppo.
+        # Le funzioni in schedulers.py prendono argomenti extra, quindi le chiudiamo
+        # in lambda di solo `epoch` (NON vanno chiamate qui: passerebbero un float).
+        backbone_fn = lambda e: backbone_lr_lambda(e, self.warmup_backbone, self.train_epochs)
+        router_fn = lambda e: router_lr_lambda(e, self.router_start_epoch, self.router_warmup, self.train_epochs)
 
-        backbone_lr_scheduler = backbone_lr_lambda(epoch=self.current_epoch, warmup_backbone=self.warmup_backbone)
-        router_lr_scheduler = router_lr_lambda(epoch=self.current_epoch, router_start_epoch=self.router_start_epoch, warmup_router=self.router_warmup)
-    
-        # Optimizer 2e-5
         self.optimizer = AdamW(
             [
-                {'params': backbone_params, 'lr': base_lr, 'weight_decay': wd, 'name' : 'backbone'}, # Conv and Linear
-                {'params' : backbone_norm, 'lr': base_lr, 'weight_decay': 0, 'name' : 'backbone_norm'},
-                {'params': router_params, 'lr': router_lr, 'weight_decay': 0, 'name' : 'router_w'},
-                {'params': router_pos_params, 'lr': router_lr * 4,  'weight_decay': 0,  'name': 'router_position'},
+                {'params': self.backbone_params, 'lr': self.lr, 'weight_decay': self.weight_decay, 'name': 'backbone'},
+                {'params': self.router_params, 'lr': self.router_lr, 'weight_decay': 0.0, 'name': 'router'},
             ], betas=(0.9, 0.98), eps=1e-8
         )
 
-        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[
-            backbone_lr_scheduler,
-            backbone_lr_scheduler,
-            router_lr_scheduler,
-            router_lr_scheduler,
-        ])
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[backbone_fn, router_fn])
 
         return [self.optimizer], [self.lr_scheduler]
 

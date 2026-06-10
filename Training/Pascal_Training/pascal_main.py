@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from torchvision.datasets import VOCSegmentation
@@ -7,7 +9,12 @@ from torchvision.transforms.v2 import functional as TF
 
 from torch.utils.data import DataLoader
 
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
+
 from Model.PCE import PCENetwork
+from Pascal_Training.PascalLitModule import PascalLitModule
 
 # Pesi caricati pre-addestrati -> usa le stesse statistiche ImageNet.
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -80,13 +87,15 @@ def instance_model(temp_init, model_path = ""):
         num_experts = 16,
         layer_number = 8,
         patch_size = 16,
-        num_classes=20,
+        num_classes=21,
         router_temp=temp_init,
         capacity_factor_train = 2.00,
         capacity_factor_val = 2.00,
         halo_for_patches=2,
         use_static_map=False,
-        unified_router = True
+        unified_router = True,
+        task="seg",
+        uniform_epochs=0,
     )
 
     return pce
@@ -154,8 +163,103 @@ def load_model(temp_init, model_path):
 
     return model
 
-train_set, val_set = download_pascal_voc()
-train_loader = DataLoader(train_set, batch_size=128, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_set, batch_size=128, shuffle=False, num_workers=4)
+def get_accelerator_and_precision():
+    if not torch.cuda.is_available():
+        return "cpu", "32-true"
 
-model = load_model(temp_init=1.75, model_path="checkpoints_unified_router/last.ckpt")
+    device_name = torch.cuda.get_device_name(0)
+    major, minor = torch.cuda.get_device_capability(0)
+    cuda_arches = getattr(torch._C, "_cuda_getArchFlags", lambda: "")()
+
+    print(f"-- CUDA GPU: {device_name} | compute capability: {major}.{minor} ---")
+    print(f"-- PyTorch CUDA: {torch.version.cuda} | compiled arches: {cuda_arches or 'unknown'} ---")
+
+    if torch.cuda.is_bf16_supported():
+        return "cuda", "bf16-mixed"
+
+    if major >= 7:
+        print("-- BF16 not supported on this GPU: using precision='16-mixed' ---")
+        return "cuda", "16-mixed"
+
+    print("-- Mixed precision not enabled for this GPU: using precision='32-true' ---")
+    return "cuda", "32-true"
+
+
+if __name__ == "__main__":
+    device, precision = get_accelerator_and_precision()
+    print(f"-- Start with device : {device} ---")
+    print(f"-- Trainer precision : {precision} ---")
+    print("\n ------------------------ \n")
+
+    # Hyperparameters
+    num_classes = 21          # VOC: 20 object classes + background
+    train_epochs = 60
+
+    backbone_lr = 2e-5        # pretrained backbone: small LR
+    head_lr = 1e-3            # segmentation head: trained from scratch
+    router_lr = 1e-3          # router: trained from scratch
+    weight_decay = 1e-3       # match Tiny_Training/main.py
+
+    # Single shared temp_init so load_model and the LitModule agree.
+    temp_init = 1.75
+    temp_final = 0.50
+    temp_epochs = 25
+
+    # Data
+    train_set, val_set = download_pascal_voc()
+    train_loader = DataLoader(train_set, batch_size=128, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_set, batch_size=128, shuffle=False, num_workers=4)
+
+    # Model: backbone/experts loaded from the unified-router checkpoint;
+    # router + prediction head are reinitialised and retrained from scratch.
+    model = load_model(temp_init=temp_init, model_path="checkpoints_unified_router/last.ckpt")
+
+    lit_module = PascalLitModule(
+        model=model,
+        backbone_lr=backbone_lr,
+        router_lr=router_lr,
+        head_lr=head_lr,
+        weight_decay=weight_decay,
+        num_classes=num_classes,
+        train_epochs=train_epochs,
+        temp_init=temp_init,
+        temp_final=temp_final,
+        temp_epochs=temp_epochs,
+    )
+
+    # Logger (same as Tiny_Training/main.py).
+    logger = WandbLogger(
+        project="PCE",
+        log_model=False,
+        name="Test-Pascal-VOC2012-Segmentation",
+    )
+    logger.experiment.define_metric("epoch")
+    logger.experiment.define_metric("*", step_metric="epoch")
+
+    checkpoint_callback = ModelCheckpoint(
+        monitor="validation/mIoU",
+        mode="max",
+        save_last=True,
+        filename="best-model",
+        dirpath="checkpoints_pascal/",
+        save_weights_only=False,
+    )
+
+    trainer = pl.Trainer(
+        max_epochs=train_epochs,
+        logger=logger,
+        precision=precision,
+        accelerator=device,
+        enable_checkpointing=True,
+        callbacks=[checkpoint_callback],
+        num_sanity_val_steps=0,
+        accumulate_grad_batches=2,
+    )
+
+    print("--- Start training --- \n")
+    if os.path.exists("checkpoints_pascal/last.ckpt"):
+        trainer.fit(lit_module, train_loader, val_loader, ckpt_path="checkpoints_pascal/last.ckpt")
+    else:
+        trainer.fit(lit_module, train_loader, val_loader)
+
+    logger.experiment.finish()

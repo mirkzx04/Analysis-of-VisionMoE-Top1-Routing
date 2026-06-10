@@ -25,6 +25,7 @@ class Router(nn.Module):
         capacity_factor_train = 1.25,
         capacity_factor_eval = 1.50,
         sem_weight_temp = 1.0,
+        uniform_epochs = 10,
         ):
         super().__init__()
         """
@@ -51,6 +52,7 @@ class Router(nn.Module):
 
         self.router_temp = router_temp
         self.sem_weight_temp = sem_weight_temp
+        self.uniform_epochs = uniform_epochs
 
 
     def forward(
@@ -125,7 +127,7 @@ class Router(nn.Module):
         else:
             logits_router = gate_out.to(dtype=torch.float32)
             z_loss = self.z_loss(logits_router)
-            spatial_loss = self.spatial_loss(pos_logits, h_patches, w_patches)
+            # spatial_loss = self.spatial_loss(pos_logits, h_patches, w_patches)
             if collect_metrics:
                 logit_stats.update({
                     "logits_std": logits_router.detach().std(),
@@ -138,7 +140,7 @@ class Router(nn.Module):
         # Route based on current phase (Uniform < 30 epochs, Specialized >= 30 epochs)
         if current_epoch == None:
             return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
-        if current_epoch < 10:
+        if current_epoch < self.uniform_epochs:
             return self._uniform_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
         if getattr(router_gate, "is_static_map", False):
             return self._static_expert_region_routing(X, logits_router, logit_stats, z_loss, spatial_loss, num_positions)
@@ -158,7 +160,7 @@ class Router(nn.Module):
         Static expert -> region routing.
 
         X: [B*P, C, H, W]
-        logits: [B*P, E], prodotti da StaticFourierMapGate, quindi dipendono solo dalla posizione
+        logits: [B*P, E], prodotti da StaticMapGate, quindi dipendono solo dalla posizione
         num_positions: P, numero di posizioni/patch per immagine
         """
 

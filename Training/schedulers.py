@@ -1,5 +1,7 @@
+import math
+
 # === HYPER PARAMETERS SCHEDULERS ===
-def temp_scheduler(self, current_epoch, router_start_epoch, router_warmup, train_epochs, temp_epochs, temp_init, temp_final):
+def temp_scheduler(current_epoch, router_start_epoch, router_warmup, train_epochs, temp_epochs, temp_init, temp_final):
     e  = int(current_epoch)
     t0 = int(router_start_epoch)
     tw = int(router_warmup)
@@ -17,9 +19,9 @@ def temp_scheduler(self, current_epoch, router_start_epoch, router_warmup, train
         cosine_dec = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1 -> 0
         return float(temp_final) + (float(temp_init) - float(temp_final)) * cosine_dec
 
-    return float(self.temp_final)
+    return float(temp_final)
 
-def noise_scheduler(self, current_epoch, router_start_epoch, router_warmup, train_epochs, temp_epochs):
+def noise_scheduler(current_epoch, router_start_epoch, router_warmup, train_epochs, temp_epochs):
     e = int(current_epoch)
     rs = int(router_start_epoch)
     rw = int(router_warmup)
@@ -48,8 +50,9 @@ def noise_scheduler(self, current_epoch, router_start_epoch, router_warmup, trai
     return noise_final
 
 # === LEARNING RAGE SCHEDULERS ===
-def backbone_lr_lambda(epoch, warmup_backbone):
+def backbone_lr_lambda(epoch, warmup_backbone, train_epochs):
     e = int(epoch)
+    T = int(train_epochs)
     if  e < warmup_backbone:
     # warmup 0 -> 1
         return (e + 1) / float(max(1, warmup_backbone))
@@ -62,8 +65,9 @@ def backbone_lr_lambda(epoch, warmup_backbone):
     cos = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1 -> 0
     return eta_min + (1.0 - eta_min) * cos            # 1 -> eta_min0
 
-def router_lr_lambda(epoch, router_start_epoch, warmup_router):
+def router_lr_lambda(epoch, router_start_epoch, warmup_router, train_epochs):
     e = int(epoch)
+    T = int(train_epochs)
     # Router spento fino a router_start_epoch
     if e < router_start_epoch:
         return 0.0
