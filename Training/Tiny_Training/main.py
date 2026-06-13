@@ -1,6 +1,17 @@
 import os
+import sys
+from pathlib import Path
 import numpy as np
 import json
+
+# Make the script executable directly by adding the project root (for `Model`,
+# `Datasets_Classes`, ...) and `Training/` (for `Tiny_Training`, `schedulers`,
+# `train_utils`) to sys.path.
+_ROOT = Path(__file__).resolve().parents[2]
+_TRAINING = Path(__file__).resolve().parents[1]
+for _p in (_ROOT, _TRAINING):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import torch
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -22,6 +33,7 @@ from Model.PCE import PCENetwork
 # from Datasets_Classes.PatchExtractor import PatchExtractor
 
 from Tiny_Training.TinyLitModule import TinyLitModule
+from config import HParams, LossWeights, AugParams, EpochParams
 
 def count_number_of_classes(train_labels, val_labels):
     return len(np.unique(np.concatenate([train_labels, val_labels])).tolist())
@@ -95,40 +107,71 @@ if __name__ == "__main__":
     print(f'-- Trainer precision : {precision} ---')
     print('\n ------------------------ \n')
 
-    # Hyperparameters of model
-    num_exp = 16
-    layer_number = 8
-    patch_size = 16
-    lr = 0.001
-    router_lr = 1e-4
-    weight_decay = 1e-3 # M
+    # Hyperparameters (Tiny-ImageNet classification). num_classes is set after
+    # the dataset is loaded. Tiny historically called the backbone LR `lr`
+    # (lr=0.001) -> mapped to backbone_lr; router_start_epoch == uniform_epochs.
+    hp = HParams(
+        # model
+        num_experts=16,
+        layer_number=8,
+        patch_size=16,
+        halo_for_patches=2,
+        input_size=224,
+        capacity_factor_train=2.00,
+        capacity_factor_val=2.00,
+        use_static_map=False,
+        unified_router=False,
+        task="class",
+        # optim / train
+        batch_size=64,
+        weight_decay=1e-3,         # M
+        backbone_lr=0.001,         # Tiny's `lr`
+        router_lr=1e-4,
+        accumulate_grad_batches=2,
+        adam_betas=(0.9, 0.98),
+        adam_eps=1e-8,
+        temp_init=1.75,
+        temp_mid=1.2,
+        temp_final=0.50,
+        # clipping (Tiny has no head group)
+        backbone_max_norm=1.5,
+        router_max_norm=0.5,
+    )
+    # Epoch counts / warmups (schedule durations).
+    ep = EpochParams(
+        train_epochs=100,
+        uniform_epochs=10,
+        warmup_backbone=15,
+        router_warmup=10,
+        temp_epochs=25,
+    )
+    # Data augmentation (mixup / cutmix)
+    aug = AugParams(
+        use_mixup_cutmix=True,
+        mixup_alpha=0.2,
+        cutmix_alpha=1.0,
+        cutmix_prob=0.3,
+    )
+    # ACTIVE aux-loss weights, applied from router_start onward (gated to 0.0
+    # before then inside the lit module). label_smoothing=0.10 for the train CE.
+    lw = LossWeights(
+        z_loss_weight=1e-2,
+        spatial_loss_weight=1e-3,
+        label_smoothing=0.10,
+    )
 
-    # Hyperparameters of router
-    capacity_factor_train = 2.00
-    capacity_factor_val = 2.00
-    halo_for_patches = 2
-
-    temp_init = 1.75
-    temp_mid = 1.2
-    temp_final = 0.50
-    temp_epochs = 25
-
-    # Training metrics
-    train_epochs = 80
-    uniform_epochs = 10
-    batch_size = 64
-
-    tiny_set = get_tinyimagenet_sets(batch_size)
+    tiny_set = get_tinyimagenet_sets(hp.batch_size)
     train_loader = tiny_set['dataloaders']['train']
     val_loader = tiny_set['dataloaders']['val']
     num_classes = tiny_set['num_classes']
+    hp.num_classes = num_classes   # set at runtime from the dataset
 
 
     print(f'Num classes : {num_classes}')
 
     print(f'--- Dataset loaded --- \n')
 
-    run_name = f"test {num_exp} experts - Patching-Overlap  | Expert -> Token - Unified"
+    run_name = f"test {hp.num_experts} experts - Patching-Overlap  | Expert -> Token - Dual Branch Stage EC"
 
     # Defines checkpointer and Logger
     logger = WandbLogger(
@@ -147,33 +190,34 @@ if __name__ == "__main__":
         save_weights_only = False,
     )
     pce = PCENetwork(
-        num_experts = num_exp,
-        layer_number = layer_number,
-        patch_size = patch_size,
-        num_classes=num_classes,
-        router_temp=temp_init,
-        capacity_factor_train = capacity_factor_train,
-        capacity_factor_val = capacity_factor_val,
-        halo_for_patches=halo_for_patches,
-        use_static_map=False,
-        unified_router = True
+        num_experts = hp.num_experts,
+        layer_number = hp.layer_number,
+        patch_size = hp.patch_size,
+        num_classes=hp.num_classes,
+        router_temp=hp.temp_init,
+        capacity_factor_train = hp.capacity_factor_train,
+        capacity_factor_val = hp.capacity_factor_val,
+        halo_for_patches=hp.halo_for_patches,
+        input_size=hp.input_size,
+        use_static_map=hp.use_static_map,
+        unified_router = hp.unified_router,
+        uniform_epochs=ep.uniform_epochs,
+        task=hp.task,
         )
     # pce = torch.compile(pce, mode="reduce-overhead")
 
     lit_module = TinyLitModule(
-        pce=pce, lr=lr, weight_decay=weight_decay, device=device, train_epochs=train_epochs,
-        uniform_epochs=uniform_epochs, temp_init=temp_init, temp_mid = temp_mid,
-        temp_final=temp_final,temp_epochs=temp_epochs, num_classes=num_classes, router_lr = router_lr,
+        pce=pce, hparams=hp, loss_weights=lw, aug_params=aug, epoch_params=ep, device=device, static="learnable",
     )
     trainer = pl.Trainer(
-        max_epochs=train_epochs,
+        max_epochs=ep.train_epochs,
         logger = logger,
         precision=precision,
         accelerator=device,
         enable_checkpointing= True,
         callbacks=[checkpoint_callback],
         num_sanity_val_steps=0,
-        accumulate_grad_batches=2,
+        accumulate_grad_batches=hp.accumulate_grad_batches,
     )
 
     print(f'--- Start training --- \n')

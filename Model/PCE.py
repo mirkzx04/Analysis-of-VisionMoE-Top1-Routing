@@ -29,7 +29,7 @@ class PCENetwork(nn.Module):
                     use_static_map = False,
                     unified_router = False,
                     task = "seg",
-                    uniform_epochs = 10
+                    uniform_epochs = 0,
                  ):
         super().__init__()
 
@@ -67,7 +67,7 @@ class PCENetwork(nn.Module):
             layer_number=layer_number,
             input_size = input_size,
             use_static_map = use_static_map,
-            unified_router = unified_router
+            unified_router = unified_router,
         )
 
         self.router = Router(
@@ -94,7 +94,7 @@ class PCENetwork(nn.Module):
                 nn.Conv2d(last_channel // 2, last_channel // 4, kernel_size= 3, padding= 1, bias= False),
                 nn.BatchNorm2d(last_channel // 4),
                 nn.SiLU(inplace=True),
-                nn.Dropout2d(0.1),
+                nn.Dropout2d(0.2),
                 nn.Conv2d(last_channel // 4, num_classes, kernel_size=1)
             )
         self.stem = nn.Sequential(
@@ -187,7 +187,7 @@ class PCENetwork(nn.Module):
             return y
         return y[:, :, h:h + patch_size, h:h + patch_size]
 
-    def forward(self, X, current_epoch=None, collect_routes = False, collect_debug = None):
+    def forward(self, X, current_epoch=None, collect_routes = False, collect_debug = None, class_labels = None):
         """
         Forward method of PCE Network
 
@@ -385,6 +385,8 @@ class PCENetwork(nn.Module):
                             expert_effective_rel_delta_sum=expert_effective_rel_delta_sum,
                             expert_effective_rel_delta_count=expert_effective_rel_delta_count,
                             num_positions=P,
+                            class_labels=class_labels if self.task == "class" else None,
+                            num_classes=self.num_classes if self.task == "class" else None,
                         )
 
                 X = rearrange(
@@ -436,7 +438,7 @@ class PCENetwork(nn.Module):
         if collect_routes:
             return logits, tot_spatial_loss, tot_z_loss, routing_debug
 
-        return logits, tot_spatial_loss, tot_z_loss,
+        return logits, tot_spatial_loss, tot_z_loss
 
 
     def _indices_from_dispatch(self, dispatch):

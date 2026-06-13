@@ -3,7 +3,7 @@ import torch
 from torch import nn
 
 from .ConvExpert import ConvExpert
-from Model.Components.Router.RouterGate import RouterGate, StaticFourierMapGate
+from Model.Components.Router.RouterGate import RouterGate, StaticMapGate
 
 class PCELayer(nn.Module):
     def __init__(self,
@@ -15,7 +15,7 @@ class PCELayer(nn.Module):
                 gate_channel,
                 kernel_size,
                 unfold_kernel_size,
-                num_positions = None, 
+                num_positions = None,
                 use_static_map = False,
                 unified_router = False,
                 ):
@@ -33,18 +33,18 @@ class PCELayer(nn.Module):
         self.activation_merge = nn.SiLU(inplace=True)
 
         if use_static_map : 
-            self.router_gate = StaticFourierMapGate(
-                num_experts=num_experts, 
+            self.router_gate = StaticMapGate(
+                num_experts=num_experts,
                 P = num_positions,
             )
         else : 
             self.router_gate = RouterGate(
-                semantic_channel=inpt_channel, 
-                fourier_channel= 2 + 4 * fourie_freq, 
-                num_experts=num_experts, 
+                semantic_channel=inpt_channel,
+                fourier_channel= 2 + 4 * fourie_freq,
+                num_experts=num_experts,
                 patch_h=unfold_kernel_size,
                 patch_w=unfold_kernel_size,
-                unified_router = unified_router
+                unified_router = unified_router,
             )
                 
         self.patch_size = patch_size

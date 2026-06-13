@@ -25,7 +25,7 @@ class Router(nn.Module):
         capacity_factor_train = 1.25,
         capacity_factor_eval = 1.50,
         sem_weight_temp = 1.0,
-        uniform_epochs = 10,
+        uniform_epochs = 0,
         ):
         super().__init__()
         """
@@ -37,7 +37,7 @@ class Router(nn.Module):
             noise_epsilon (float): Epsilon for noise stability.
             router_temp (float): Temperature for the router logits.
             sem_weight_temp (float): Temperature of the semantic weighting softmax,
-                renormalized per token over the experts that selected it (S(n)).
+            renormalized per token over the experts that selected it (S(n)).
             capacity_factor_train (float): Capacity factor during training.
             capacity_factor_eval (float): Capacity factor during evaluation.
             noise_std (float): Standard deviation for the noise added to logits.
@@ -77,7 +77,7 @@ class Router(nn.Module):
         Returns:
             dispatch (torch.Tensor): Dispatch tensor for routing.
             combine (torch.Tensor): Combine tensor for aggregating results.
-            z_loss (torch.Tensor): Z-loss value.
+            z_loss (torch.Tensor): Router z-loss value.
             aux_loss (torch.Tensor): Auxiliary load balancing loss.
             logits (torch.Tensor): Raw logits (detached, on CPU).
             logit_stats (dict): Optional router std metrics, including the
@@ -106,15 +106,15 @@ class Router(nn.Module):
         if isinstance(gate_out, tuple):
             sem_logits, pos_logits = gate_out
             sem_logits, pos_logits = sem_logits.float(), pos_logits.float()
-            
-            # Selection by position only; semantics only weights the chosen expert's
-            # output (0.8*sem + 0.2*pos) downstream in _specialized_routing.
+
+            # Selection by position; semantics weights the chosen expert's output
+            # downstream in _specialized_routing.
             weighting_logits = sem_logits
             selection_logits = pos_logits
 
             logits_router = (selection_logits, weighting_logits)
             if ( self.training and not getattr(router_gate, "is_static_map", False) and not unified_router and h_patches is not None and w_patches is not None):
-                spatial_loss = self.spatial_loss(pos_logits, h_patches, w_patches)
+                spatial_loss = self.spatial_loss(selection_logits, h_patches, w_patches)
             z_loss = self.z_loss(weighting_logits)
 
             if collect_metrics:
@@ -139,13 +139,13 @@ class Router(nn.Module):
 
         # Route based on current phase (Uniform < 30 epochs, Specialized >= 30 epochs)
         if current_epoch == None:
-            return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
+            return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss, collect_metrics)
         if current_epoch < self.uniform_epochs:
             return self._uniform_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
         if getattr(router_gate, "is_static_map", False):
             return self._static_expert_region_routing(X, logits_router, logit_stats, z_loss, spatial_loss, num_positions)
         else:
-            return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
+            return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss, collect_metrics)
 
     def _static_expert_region_routing(
         self,
@@ -228,7 +228,7 @@ class Router(nn.Module):
 
         return routing_state, spatial_loss, z_loss, logits.detach(), logit_stats
 
-    def _specialized_routing(self, X, logits, logit_stats, z_loss, spatial_loss):
+    def _specialized_routing(self, X, logits, logit_stats, z_loss, spatial_loss, collect_metrics=False):
         """
         Specialized top-1 routing (Phase 2/3).
 
@@ -241,7 +241,7 @@ class Router(nn.Module):
         # Adding noise in logits (only the selection branch when decoupled)
         if self.training and self.noise_std > 0:
             if isinstance(logits, tuple):
-                logits = (logits[0] + torch.randn_like(logits[0]) * self.noise_std, logits[1])
+                logits = (logits[0] + torch.randn_like(logits[0]) * self.noise_std,) + tuple(logits[1:])
             else:
                 logits = logits + torch.randn_like(logits.float()) * self.noise_std
 
@@ -269,9 +269,9 @@ class Router(nn.Module):
         slot_idx = torch.arange(k, device=X.device).view(1, k).expand(E, k)
 
         if isinstance(logits, tuple):
-            # Semantic weighting renormalized over S(n) = {experts that selected token n}.
+            # --- Stage 2: semantic weighting renormalized over S(n) = {experts that selected token n} ---
             sem_logits = logits[1]                                # [N, E]
-            sel_sem_logit = sem_logits.gather(0, topk_idx)        # [k, E] = s_e(n) per dispatched pair
+            sel_sem_logit = sem_logits.gather(0, topk_idx)
             flat_tok = topk_idx.reshape(-1)
 
             # Per-token max over S(n) for numerical stability (sem logits std is large/rising).
@@ -287,8 +287,12 @@ class Router(nn.Module):
             denom = torch.zeros(N, device=X.device, dtype=num.dtype).index_add(
                 0, flat_tok, num.reshape(-1)
             )                                                     # denom[n] = sum_{e' in S(n)} exp(...)
+            w_sem = num / (denom[topk_idx] + 1e-9)                # [k, E] convex over S(n)
 
-            weights = (num / (denom[topk_idx] + 1e-9)).transpose(0, 1).contiguous().float()  # [E, k]
+            p_sel = F.softmax(logits[0] / self.router_temp, dim=-1).gather(0, topk_idx)  # [k, E]
+            p_sel_st = 1.0 + p_sel - p_sel.detach()
+
+            weights = (w_sem * p_sel_st).transpose(0, 1).contiguous().float()  # [E, k]
         else:
             weights = topk_prob.transpose(0, 1).contiguous().float()
         routing_state = RoutingState(

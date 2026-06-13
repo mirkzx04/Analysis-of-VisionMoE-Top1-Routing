@@ -21,38 +21,33 @@ from Model.Components.DownsampleResBlock import DownsampleResBlock
 from schedulers import temp_scheduler, noise_scheduler, backbone_lr_lambda, router_lr_lambda
 from train_utils import collect_model_prameters, collect_router_metrics, clip_gradients
 
+from config import HParams, LossWeights, AugParams, EpochParams
+
 class TinyLitModule(pl.LightningModule):
     def __init__(
                 self,
                 pce,
-                lr,
-                router_lr,
-                weight_decay,
-                num_classes,
+                hparams: HParams,
+                loss_weights: LossWeights,
+                aug_params: AugParams,
+                epoch_params: EpochParams,
                 device,
-                train_epochs,
-                uniform_epochs,
-                temp_init,
-                temp_mid,
-                temp_final,
-                temp_epochs,
+                static: str = "learnable",
             ):
 
         """
-        Initialize the EMADiffLitModule.
+        Initialize the TinyLitModule.
 
         Args:
-            num_experts (int): Number of experts.
-            layer_number (int): Number of layers.
-            patch_size (int): Patch size.
-            dropout (float): Dropout rate.
-            num_classes (int): Number of classes.
-            nucleus_sampling_p (float): Nucleus sampling probability.
-            lr (float): Learning rate.
-            weight_decay (float): Weight decay.
-            augmentation: Data augmentation object.
-            class_names (list): List of class names.
-            device (str): Device to use.
+            pce: PCENetwork model.
+            hparams (HParams): model / optimizer / schedule config.
+            loss_weights (LossWeights): aux-loss weights + CE config; ACTIVE values
+                applied from router_start onward (gated to 0.0 before).
+            aug_params (AugParams): data-augmentation config (mixup / cutmix).
+            epoch_params (EpochParams): epoch counts and warmups (schedule durations).
+            device (str): Device to use (for the accuracy metrics).
+            static (str): "learnable" (default) or "not_learnable"; keeps the static
+                map (pos_coeff) frozen on unfreeze when "not_learnable".
         Returns:
             None
         """
@@ -60,30 +55,44 @@ class TinyLitModule(pl.LightningModule):
         super().__init__()
         # Model and optimizer parameters
         self.model = pce
-        self.lr = lr
-        self.router_lr = router_lr
-        self.weight_decay = weight_decay
+        self.hp = hparams
+        self.lw = loss_weights
 
-        self.temp_init = temp_init # Logits router temperature
-        self.temp_mid = temp_mid
-        self.temp_final = temp_final
-        self.temp_epochs = temp_epochs
-        self.num_classes = num_classes
+        # Controls whether the static map (pos_coeff) is trainable when unfrozen.
+        assert static in ("learnable", "not_learnable")
+        self.static = static
+
+        self.lr = hparams.backbone_lr
+        self.router_lr = hparams.router_lr
+        self.weight_decay = hparams.weight_decay
+
+        self.temp_init = hparams.temp_init # Logits router temperature
+        self.temp_mid = hparams.temp_mid
+        self.temp_final = hparams.temp_final
+        self.temp_epochs = epoch_params.temp_epochs
+        self.num_classes = hparams.num_classes
 
         self.router_mul = 2.0
-        self.warmup_backbone = 15
-        self.router_start_epoch = uniform_epochs
-        self.router_warmup = 10
+        self.warmup_backbone = epoch_params.warmup_backbone
+        # router_start_epoch == uniform_epochs (derived, not a hyperparameter)
+        self.router_start_epoch = epoch_params.uniform_epochs
+        self.router_warmup = epoch_params.router_warmup
         self.use_augmentation = True
 
-        self.train_epochs = train_epochs
-        self.uniform_epochs = uniform_epochs
+        self.train_epochs = epoch_params.train_epochs
+        self.uniform_epochs = epoch_params.uniform_epochs
+
+        # Per-group gradient-clip thresholds (Tiny has no head group).
+        self.backbone_max_norm = hparams.backbone_max_norm
+        self.router_max_norm = hparams.router_max_norm
 
         # Training losses
         self.train_class_losses = []
         self.train_aux_losses = []
         self.train_raw_spatial_losses = []
         self.train_weighted_spatial_losses = []
+        self.train_raw_z_losses = []
+        self.train_weighted_z_losses = []
         self.train_total_losses = []
 
         # Validation losses
@@ -91,6 +100,8 @@ class TinyLitModule(pl.LightningModule):
         self.val_aux_losses = []
         self.val_raw_spatial_losses = []
         self.val_weighted_spatial_losses = []
+        self.val_raw_z_losses = []
+        self.val_weighted_z_losses = []
         self.val_total_losses = []
         
         self.gradient_norm_router = []
@@ -102,28 +113,29 @@ class TinyLitModule(pl.LightningModule):
         # Best validation loss
         self.best_val_loss = float('+inf')
 
-        self.use_mixup_cutmix = True
-        self.mixup_alpha      = 0.2
-        self.cutmix_alpha     = 1.0
-        self.cutmix_prob      = 0.3
+        self.use_mixup_cutmix = aug_params.use_mixup_cutmix
+        self.mixup_alpha      = aug_params.mixup_alpha
+        self.cutmix_alpha     = aug_params.cutmix_alpha
+        self.cutmix_prob      = aug_params.cutmix_prob
 
+        # Aux losses gated off until router_start (set to active values in on_train_epoch_start)
         self.z_loss_weigth = 0.0
         self.spatial_loss_weight = 0.0
 
         # Accuracy metrics
         self.accuracy_metrics = {
-            'top1_train' : Accuracy(task='multiclass', num_classes=num_classes, top_k=1).to(device),
-            'top5_train' : Accuracy(task='multiclass', num_classes=num_classes, top_k=5).to(device),
+            'top1_train' : Accuracy(task='multiclass', num_classes=self.num_classes, top_k=1).to(device),
+            'top5_train' : Accuracy(task='multiclass', num_classes=self.num_classes, top_k=5).to(device),
 
-            'top1_val' : Accuracy(task='multiclass', num_classes=num_classes, top_k=1).to(device),
-            'top5_val' : Accuracy(task='multiclass', num_classes=num_classes, top_k=5).to(device)
+            'top1_val' : Accuracy(task='multiclass', num_classes=self.num_classes, top_k=1).to(device),
+            'top5_val' : Accuracy(task='multiclass', num_classes=self.num_classes, top_k=5).to(device)
         }
         # Loss function
         self.val_loss = torch.nn.CrossEntropyLoss()
-        self.train_loss = torch.nn.CrossEntropyLoss(label_smoothing=0.10) # M
+        self.train_loss = torch.nn.CrossEntropyLoss(label_smoothing=loss_weights.label_smoothing) # M
 
 
-    def forward(self, x, force_specialized = False):
+    def forward(self, x, force_specialized = False, class_labels = None):
         """
         Forward pass of the model.
 
@@ -133,7 +145,13 @@ class TinyLitModule(pl.LightningModule):
         Returns:
             Tensor: Output logits from the model.
         """
-        return self.model(x, current_epoch=self.current_epoch, collect_routes=True, collect_debug=False)
+        return self.model(
+            x,
+            current_epoch=self.current_epoch,
+            collect_routes=True,
+            collect_debug=False,
+            class_labels=class_labels,
+        )
 
     def training_step(self, batch, batch_idx):
         """
@@ -167,19 +185,21 @@ class TinyLitModule(pl.LightningModule):
             )
 
         else:
-            logits, spatial_loss, z_loss, _ = self(data)
+            logits, spatial_loss, z_loss, _ = self(data, class_labels=labels)
             class_loss = self.train_loss(logits, labels)
 
         weighted_spatial_loss = spatial_loss * self.spatial_loss_weight
-        aux_loss = (z_loss * self.z_loss_weigth) + weighted_spatial_loss
+        weighted_z_loss = z_loss * self.z_loss_weigth
+        aux_loss = weighted_z_loss + weighted_spatial_loss
         total_loss = class_loss + aux_loss
 
-        # Store detached on-device scalars and reduce once per epoch (see
-        # on_train_epoch_end) instead of forcing a GPU->CPU sync every step.
+        # Detached on-device scalars, reduced once per epoch (avoids per-step GPU->CPU sync)
         self.train_class_losses.append(class_loss.detach())
         self.train_aux_losses.append(aux_loss.detach())
         self.train_raw_spatial_losses.append(spatial_loss.detach())
         self.train_weighted_spatial_losses.append(weighted_spatial_loss.detach())
+        self.train_raw_z_losses.append(z_loss.detach())
+        self.train_weighted_z_losses.append(weighted_z_loss.detach())
 
         self.train_total_losses.append(total_loss.detach())
 
@@ -204,8 +224,8 @@ class TinyLitModule(pl.LightningModule):
         clip_gradients(
             backbone_params=self.backbone_params,
             router_params=self.router_params,
-            backbone_max_norm=1.5,
-            router_max_norm=0.5,
+            backbone_max_norm=self.backbone_max_norm,
+            router_max_norm=self.router_max_norm,
         )
 
     def on_train_epoch_start(self):
@@ -221,8 +241,8 @@ class TinyLitModule(pl.LightningModule):
 
         elif e >= self.router_start_epoch:
             self._unfreeze_router()
-            self.z_loss_weigth = 1e-2
-            self.spatial_loss_weight = 1e-3
+            self.z_loss_weigth = self.lw.z_loss_weight
+            self.spatial_loss_weight = self.lw.spatial_loss_weight
 
             self.model.router.router_temp = temp_scheduler(
                 current_epoch=self.current_epoch, 
@@ -233,7 +253,7 @@ class TinyLitModule(pl.LightningModule):
                 temp_init=self.temp_init, 
                 temp_final=self.temp_final
             )
-            self.model.router.noise_std = self.noise_scheduler(
+            self.model.router.noise_std = noise_scheduler(
                 current_epoch=self.current_epoch, 
                 router_start_epoch = self.router_start_epoch,
                 router_warmup = self.router_warmup,
@@ -266,6 +286,8 @@ class TinyLitModule(pl.LightningModule):
             'training/train_aux_loss' : self._mean_tensor(self.train_aux_losses),
             'training/raw_spatial_loss' : self._mean_tensor(self.train_raw_spatial_losses),
             'training/weighted_spatial_loss' : self._mean_tensor(self.train_weighted_spatial_losses),
+            'training/raw_z_loss' : self._mean_tensor(self.train_raw_z_losses),
+            'training/weighted_z_loss' : self._mean_tensor(self.train_weighted_z_losses),
             'training/train_total_loss' : self._mean_tensor(self.train_total_losses),
 
             'training/train_top1' : self.accuracy_metrics['top1_train'].compute().item() * 100,
@@ -281,6 +303,8 @@ class TinyLitModule(pl.LightningModule):
         self.train_aux_losses.clear()
         self.train_raw_spatial_losses.clear()
         self.train_weighted_spatial_losses.clear()
+        self.train_raw_z_losses.clear()
+        self.train_weighted_z_losses.clear()
         self.train_total_losses.clear()
         self.train_class_losses.clear()
         self.train_aux_losses.clear()
@@ -306,20 +330,22 @@ class TinyLitModule(pl.LightningModule):
         data, labels = batch
         data, labels = data.to(self.device), labels.to(self.device)
 
-        logits, spatial_loss, z_loss, _ = self(data)
+        logits, spatial_loss, z_loss, _ = self(data, class_labels=labels)
 
         class_loss = self.val_loss(logits, labels)
 
         weighted_spatial_loss = spatial_loss * self.spatial_loss_weight
-        aux_loss = ((z_loss * self.z_loss_weigth) + weighted_spatial_loss)
+        weighted_z_loss = z_loss * self.z_loss_weigth
+        aux_loss = (weighted_z_loss + weighted_spatial_loss)
         total_loss = class_loss + aux_loss
 
-        # Detached on-device scalars, reduced once per epoch (see
-        # on_validation_epoch_end) to avoid a GPU->CPU sync every step.
+        # Detached on-device scalars, reduced once per epoch (avoids per-step GPU->CPU sync)
         self.val_class_losses.append(class_loss.detach())
         self.val_aux_losses.append(aux_loss.detach())
         self.val_raw_spatial_losses.append(spatial_loss.detach())
         self.val_weighted_spatial_losses.append(weighted_spatial_loss.detach())
+        self.val_raw_z_losses.append(z_loss.detach())
+        self.val_weighted_z_losses.append(weighted_z_loss.detach())
         self.val_total_losses.append(total_loss.detach())
 
         if self.num_classes >= 5:
@@ -348,6 +374,8 @@ class TinyLitModule(pl.LightningModule):
             'validation/val_aux_loss' : self._mean_tensor(self.val_aux_losses),
             'validation/raw_spatial_loss' : self._mean_tensor(self.val_raw_spatial_losses),
             'validation/weighted_spatial_loss' : self._mean_tensor(self.val_weighted_spatial_losses),
+            'validation/raw_z_loss' : self._mean_tensor(self.val_raw_z_losses),
+            'validation/weighted_z_loss' : self._mean_tensor(self.val_weighted_z_losses),
             'validation/val_total_loss' : self._mean_tensor(self.val_total_losses),
             'validation/val_top1' : self.accuracy_metrics['top1_val'].compute().item() * 100,
             'validation/val_top5' : self.accuracy_metrics['top5_val'].compute().item() * 100,
@@ -357,6 +385,8 @@ class TinyLitModule(pl.LightningModule):
         self.val_aux_losses.clear()
         self.val_raw_spatial_losses.clear()
         self.val_weighted_spatial_losses.clear()
+        self.val_raw_z_losses.clear()
+        self.val_weighted_z_losses.clear()
         self.val_total_losses.clear()
 
         log_dict.update(collect_router_metrics('router-val', self.model))
@@ -367,9 +397,7 @@ class TinyLitModule(pl.LightningModule):
 
         self.backbone_params, self.router_params = collect_model_prameters(self.model)
 
-        # LambdaLR vuole callable(epoch) -> moltiplicatore del base_lr del gruppo.
-        # Le funzioni in schedulers.py prendono argomenti extra, quindi le chiudiamo
-        # in lambda di solo `epoch` (NON vanno chiamate qui: passerebbero un float).
+        # LambdaLR vuole callable(epoch); chiudiamo le fn di schedulers.py sui soli `epoch`
         backbone_fn = lambda e: backbone_lr_lambda(e, self.warmup_backbone, self.train_epochs)
         router_fn = lambda e: router_lr_lambda(e, self.router_start_epoch, self.router_warmup, self.train_epochs)
 
@@ -377,7 +405,7 @@ class TinyLitModule(pl.LightningModule):
             [
                 {'params': self.backbone_params, 'lr': self.lr, 'weight_decay': self.weight_decay, 'name': 'backbone'},
                 {'params': self.router_params, 'lr': self.router_lr, 'weight_decay': 0.0, 'name': 'router'},
-            ], betas=(0.9, 0.98), eps=1e-8
+            ], betas=self.hp.adam_betas, eps=self.hp.adam_eps
         )
 
         self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[backbone_fn, router_fn])
@@ -396,6 +424,9 @@ class TinyLitModule(pl.LightningModule):
     def _unfreeze_router(self):
         for l in self.model.layers:
             if not isinstance(l, DownsampleResBlock):
+                # Keep a frozen static map frozen when static="not_learnable".
+                if getattr(l.router_gate, "is_static_map", False) and self.static == "not_learnable":
+                    continue
                 for p in l.router_gate.parameters():
                     p.requires_grad_(True)
 

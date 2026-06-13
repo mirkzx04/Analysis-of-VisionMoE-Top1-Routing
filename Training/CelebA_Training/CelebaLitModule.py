@@ -9,44 +9,48 @@ from torch.optim.lr_scheduler import LambdaLR
 from torchmetrics import JaccardIndex
 from torchmetrics.classification import MulticlassAccuracy
 
-from Model.Components.DownsampleResBlock import DownsampleResBlock
+from config import HParams, LossWeights, EpochParams
 from train_utils import collect_model_prameters, collect_router_metrics, clip_gradients
 from schedulers import backbone_lr_lambda, router_lr_lambda, temp_scheduler, noise_scheduler
 
-from config import HParams, LossWeights, EpochParams
+from Model.Components.DownsampleResBlock import DownsampleResBlock
 
-class PascalLitModule(pl.LightningModule):
-    def __init__(
-        self,
-        model,
-        hparams: HParams,
-        loss_weights: LossWeights,
-        epoch_params: EpochParams,
-        static: str = "learnable",
-    ):
 
+class CelebaLitModule(pl.LightningModule):
+    """CelebAMask-HQ face parsing (semantic segmentation, 19 classes).
+
+    Modeled on PascalLitModule. Trained FROM SCRATCH: backbone, head and router
+    all start at epoch 0 with their own warmups; aux losses active from the start.
+
+    Args:
+        static: "learnable" (default) or "not_learnable"; keeps the static map
+            (pos_coeff) frozen on unfreeze when "not_learnable".
+    """
+
+    def __init__(self, model, hparams: HParams, loss_weights: LossWeights, epoch_params: EpochParams, static: str = "learnable"):
         super().__init__()
         self.save_hyperparameters(ignore=['model'])
 
         self.model = model
-        self.hp = hparams
-        self.lw = loss_weights
 
         # Controls whether the static map (pos_coeff) is trainable when unfrozen.
         assert static in ("learnable", "not_learnable")
         self.static = static
 
+        # Optimizer / schedule hyperparameters (from HParams)
         self.backbone_lr = hparams.backbone_lr
         self.router_lr = hparams.router_lr
         self.head_lr = hparams.head_lr
         self.weight_decay = hparams.weight_decay
         self.num_classes = hparams.num_classes
 
+        self.adam_betas = hparams.adam_betas
+        self.adam_eps = hparams.adam_eps
+
         self.temp_init = hparams.temp_init
         self.temp_final = hparams.temp_final
         self.temp_epochs = epoch_params.temp_epochs
 
-        # Pretrained backbone: short warmup. Head and router start from scratch..
         self.warmup_backbone = epoch_params.warmup_backbone
         self.head_warmup = epoch_params.head_warmup
         self.router_warmup = epoch_params.router_warmup
@@ -54,19 +58,24 @@ class PascalLitModule(pl.LightningModule):
         self.router_start_epoch = epoch_params.uniform_epochs
 
         self.train_epochs = epoch_params.train_epochs
-        self.uniform_epochs = epoch_params.uniform_epochs
 
-        # Per-group gradient-clip thresholds.
+        # Per-group gradient clip thresholds.
         self.backbone_max_norm = hparams.backbone_max_norm
         self.router_max_norm = hparams.router_max_norm
         self.head_max_norm = hparams.head_max_norm
 
-        # Aux losses gated: off (0.0) during uniform-routing, set to LossWeights
+        self.uniform_epochs = epoch_params.uniform_epochs
+
+        # Loss weights (from LossWeights)
+        self.lw = loss_weights
+        # Aux losses gated: 0.0 during uniform window, set to LossWeights values
         # from router_start_epoch onward (see on_train_epoch_start).
         self.z_loss_weigth = 0.0
         self.spatial_loss_weight = 0.0
+        self.ignore_index = loss_weights.ignore_index
+        self.label_smoothing = loss_weights.label_smoothing
 
-        # Training losses (on-device scalars, reduced once per epoch)
+        # Training losses (on-device scalars, reduced at epoch end)
         self.train_seg_losses = []
         self.train_aux_losses = []
         self.train_raw_spatial_losses = []
@@ -87,17 +96,20 @@ class PascalLitModule(pl.LightningModule):
         # Snapshot of train router metrics, taken at on_validation_epoch_start
         self._train_router_metrics = {}
 
-        # Per-pixel CE, ignore_index = VOC void/border (255)
-        ignore_index = loss_weights.ignore_index
-        label_smoothing = loss_weights.label_smoothing
-        self.train_loss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index, label_smoothing=label_smoothing)
-        self.val_loss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+        # Per-pixel CE, ignore_index = padding (255).
+        self.train_loss = torch.nn.CrossEntropyLoss(
+            ignore_index=self.ignore_index, label_smoothing=self.label_smoothing
+        )
+        self.val_loss = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 
         # Segmentation metrics
         self.metrics = nn.ModuleDict({
-            "miou":   JaccardIndex(task="multiclass", num_classes=self.num_classes, ignore_index=ignore_index, average="macro"),
-            "pixacc": MulticlassAccuracy(num_classes=self.num_classes, ignore_index=ignore_index, average="micro"),
-            "macc":   MulticlassAccuracy(num_classes=self.num_classes, ignore_index=ignore_index, average="macro"),
+            "miou":   JaccardIndex(task="multiclass", num_classes=self.num_classes,
+                                   ignore_index=self.ignore_index, average="macro"),
+            "pixacc": MulticlassAccuracy(num_classes=self.num_classes,
+                                         ignore_index=self.ignore_index, average="micro"),
+            "macc":   MulticlassAccuracy(num_classes=self.num_classes,
+                                         ignore_index=self.ignore_index, average="macro"),
         })
 
     def forward(self, x):
@@ -105,7 +117,7 @@ class PascalLitModule(pl.LightningModule):
 
     @staticmethod
     def _mean_tensor(values):
-        """Mean of a list of detached on-device scalar tensors."""
+        """Mean of a list of detached on-device scalar tensors, materialised once."""
         if not values:
             return 0.0
         return torch.stack(values).float().mean().item()
@@ -166,8 +178,8 @@ class PascalLitModule(pl.LightningModule):
         with torch.no_grad():
             self.model.moe_aggregator.reset()
 
-        # Freeze router during uniform-routing (e < uniform_epochs); from
-        # router_start_epoch on, unfreeze, activate aux losses, advance schedules.
+        # Freeze router during uniform window (e < uniform_epochs); from
+        # router_start_epoch onward unfreeze, activate aux losses, advance schedules.
         e = self.current_epoch
         if e < self.uniform_epochs:
             self._freeze_router()
@@ -177,7 +189,7 @@ class PascalLitModule(pl.LightningModule):
             self.z_loss_weigth = self.lw.z_loss_weight
             self.spatial_loss_weight = self.lw.spatial_loss_weight
 
-            # Advance temp/noise schedules
+            # Advance temp/noise schedules now that the router trains.
             self.model.router.router_temp = temp_scheduler(
                 current_epoch=self.current_epoch,
                 router_start_epoch=self.router_start_epoch,
@@ -259,12 +271,12 @@ class PascalLitModule(pl.LightningModule):
         self.log_dict(log_dict, prog_bar=True, logger=True, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
-        # 3 groups: backbone (pretrained), head (from scratch), router (from scratch).
+        # 3 groups: backbone, head, router (all from scratch on CelebA).
         self.backbone_params, self.router_params, self.head_params = collect_model_prameters(
             self.model, collect_head=True
         )
 
-        # Head follows the backbone schedule but with its own warmup (head_warmup)
+        # Head follows the backbone schedule but with its own warmup.
         backbone_fn = lambda e: backbone_lr_lambda(e, self.warmup_backbone, self.train_epochs)
         head_fn     = lambda e: backbone_lr_lambda(e, self.head_warmup, self.train_epochs)
         router_fn   = lambda e: router_lr_lambda(e, self.router_start_epoch, self.router_warmup, self.train_epochs)
@@ -275,7 +287,7 @@ class PascalLitModule(pl.LightningModule):
                 {'params': self.backbone_params, 'lr': self.backbone_lr, 'weight_decay': self.weight_decay, 'name': 'backbone'},
                 {'params': self.head_params,     'lr': self.head_lr,     'weight_decay': self.weight_decay, 'name': 'head'},
                 {'params': self.router_params,   'lr': self.router_lr,   'weight_decay': 0.0,               'name': 'router'},
-            ], betas=self.hp.adam_betas, eps=self.hp.adam_eps
+            ], betas=self.adam_betas, eps=self.adam_eps
         )
 
         self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[backbone_fn, head_fn, router_fn])

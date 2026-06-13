@@ -24,8 +24,9 @@ class RouterGate(nn.Module):
             self.position_w = nn.Parameter(
                 torch.rand(num_experts, fourier_channel)
             ) # Shape : [E, F]
-            self.position_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
-            self.semantic_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
+            # self.position_scale = nn.Parameter(torch.tensor(1.0))
+            # self.semantic_scale = nn.Parameter(torch.tensor(1.0))
+
             self.initialize_weights()
         else :
             self.W = nn.Parameter(
@@ -56,7 +57,7 @@ class RouterGate(nn.Module):
 
             pos_flat = positional_features.to(dtype=sem_logits.dtype)
             pos_w = self.position_w.to(dtype=pos_flat.dtype)
-            pos_logits = (pos_flat.matmul(pos_w.transpose(0, 1))) # [N, E]
+            pos_logits = pos_flat.matmul(pos_w.transpose(0, 1)) # [N, E]
 
         return (sem_logits, pos_logits)
 

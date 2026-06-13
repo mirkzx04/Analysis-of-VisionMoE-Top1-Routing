@@ -1,4 +1,15 @@
 import os
+import sys
+from pathlib import Path
+
+# Rendi lo script eseguibile direttamente: aggiungi la root del progetto (per
+# `Model`, `Datasets_Classes`, ...) e la cartella `Training/` (per `train_utils`,
+# `schedulers`, il package `Pascal_Training`) al sys.path.
+_ROOT = Path(__file__).resolve().parents[2]       # .../Positional_Convolution_Experts-main
+_TRAINING = Path(__file__).resolve().parents[1]   # .../Training
+for _p in (_ROOT, _TRAINING):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import torch
 
@@ -15,8 +26,9 @@ from pytorch_lightning.loggers import WandbLogger
 
 from Model.PCE import PCENetwork
 from Pascal_Training.PascalLitModule import PascalLitModule
+from config import HParams, LossWeights, EpochParams
 
-# Pesi caricati pre-addestrati -> usa le stesse statistiche ImageNet.
+# Normalizzazione con statistiche ImageNet (standard).
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 VOC_IGNORE_INDEX = 255  # bordo "void" di VOC -> ignore_index nella loss
@@ -82,86 +94,24 @@ def download_pascal_voc():
 
     return train_set, val_set
 
-def instance_model(temp_init, model_path = ""):
+def instance_model(hp: HParams, ep: EpochParams):
     pce = PCENetwork(
-        num_experts = 16,
-        layer_number = 8,
-        patch_size = 16,
-        num_classes=21,
-        router_temp=temp_init,
-        capacity_factor_train = 2.00,
-        capacity_factor_val = 2.00,
-        halo_for_patches=2,
-        use_static_map=False,
-        unified_router = True,
-        task="seg",
-        uniform_epochs=0,
+        num_experts = hp.num_experts,
+        layer_number = hp.layer_number,
+        patch_size = hp.patch_size,
+        num_classes=hp.num_classes,
+        router_temp=hp.temp_init,
+        capacity_factor_train = hp.capacity_factor_train,
+        capacity_factor_val = hp.capacity_factor_val,
+        halo_for_patches=hp.halo_for_patches,
+        input_size=hp.input_size,
+        use_static_map=hp.use_static_map,
+        unified_router = hp.unified_router,
+        task=hp.task,
+        uniform_epochs=ep.uniform_epochs,
     )
 
     return pce
-
-def clean_state_dict(state_dict):
-    """Align Lightning checkpoint keys with PCENetwork parameter names."""
-    cleaned = {}
-    for k, v in state_dict.items():
-        clean_k = k.removeprefix("model.")
-
-        if clean_k.endswith(".gamma"):
-            continue
-
-        clean_k = clean_k.replace(".router_gate.expert_emb", ".router_gate.W")
-        cleaned[clean_k] = v
-
-    return cleaned
-
-def load_model(temp_init, model_path):
-    """
-    Load checkpoint weights into PCENetwork while EXCLUDING the router and the
-    prediction head, which must be retrained from scratch on Pascal VOC.
-
-    The router trainable parameters live in `layer.router_gate`
-    (RouterGate: `W` for unified, `semantic_w`/`position_w` for dual-branch);
-    `self.router` has no weights. The classifier head is `prediction_head.*`.
-    Filtering out these keys leaves those modules at their initialization values.
-    """
-    model = instance_model(temp_init)
-
-    checkpoint = torch.load(model_path, map_location="cpu")
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
-
-    state_dict = clean_state_dict(state_dict)
-
-    # Keys to exclude: router gates and prediction head. They keep their
-    # random initialization and get retrained from scratch.
-    def is_excluded(k):
-        return (
-            "router_gate" in k
-            or k.startswith("router.")
-            or k.startswith("prediction_head.")
-        )
-
-    excluded_keys = [k for k in state_dict if is_excluded(k)]
-    for k in excluded_keys:
-        del state_dict[k]
-
-    # strict=False because the excluded keys are intentionally missing.
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-
-    # Sanity check: the only missing keys must be the ones we excluded.
-    unexpected_missing = [k for k in missing if not is_excluded(k)]
-    if unexpected_missing:
-        raise RuntimeError(f"Chiavi mancanti non previste: {unexpected_missing}")
-    if unexpected:
-        raise RuntimeError(f"Chiavi inattese nel checkpoint: {unexpected}")
-
-    print(f"[load_model] Caricati {len(state_dict)} tensori; esclusi "
-          f"{len(excluded_keys)} parametri (router + prediction head), "
-          f"riaddestrati da zero.")
-
-    return model
 
 def get_accelerator_and_precision():
     if not torch.cuda.is_available():
@@ -191,47 +141,73 @@ if __name__ == "__main__":
     print(f"-- Trainer precision : {precision} ---")
     print("\n ------------------------ \n")
 
-    # Hyperparameters
-    num_classes = 21          # VOC: 20 object classes + background
-    train_epochs = 60
-
-    backbone_lr = 2e-5        # pretrained backbone: small LR
-    head_lr = 1e-3            # segmentation head: trained from scratch
-    router_lr = 1e-3          # router: trained from scratch
-    weight_decay = 1e-3       # match Tiny_Training/main.py
-
-    # Single shared temp_init so load_model and the LitModule agree.
-    temp_init = 1.75
-    temp_final = 0.50
-    temp_epochs = 25
+    # Hyperparameters (VOC segmentation, trained from scratch).
+    hp = HParams(
+        # model
+        num_experts=16,
+        layer_number=8,
+        patch_size=16,
+        halo_for_patches=2,
+        input_size=224,
+        capacity_factor_train=2.00,
+        capacity_factor_val=2.00,
+        use_static_map=False,
+        unified_router=False,
+        task="seg",
+        num_classes=21,            # VOC: 20 object classes + background
+        # optim / train
+        batch_size=64,
+        weight_decay=1e-2,         # match Tiny_Training/main.py
+        backbone_lr=1e-3,          # from scratch
+        head_lr=1e-3,              # segmentation head: trained from scratch
+        router_lr=1e-3,            # router: trained from scratch
+        accumulate_grad_batches=2,
+        adam_betas=(0.9, 0.98),
+        adam_eps=1e-8,
+        temp_init=1.75,
+        temp_final=0.50,
+        # clipping
+        backbone_max_norm=1.5,
+        router_max_norm=0.5,
+        head_max_norm=1.0,
+    )
+    # Epoch counts / warmups (schedule durations).
+    ep = EpochParams(
+        train_epochs=60,
+        uniform_epochs=0,
+        warmup_backbone=5,
+        head_warmup=10,
+        router_warmup=5,
+        temp_epochs=25,
+    )
+    lw = LossWeights(
+        z_loss_weight=1e-2,
+        spatial_loss_weight=1e-5,
+        label_smoothing=0.0,
+        ignore_index=VOC_IGNORE_INDEX,
+    )
 
     # Data
     train_set, val_set = download_pascal_voc()
-    train_loader = DataLoader(train_set, batch_size=128, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_set, batch_size=128, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_set, batch_size=hp.batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_set, batch_size=hp.batch_size, shuffle=False, num_workers=4)
 
-    # Model: backbone/experts loaded from the unified-router checkpoint;
-    # router + prediction head are reinitialised and retrained from scratch.
-    model = load_model(temp_init=temp_init, model_path="checkpoints_unified_router/last.ckpt")
+    # Model: from scratch (fresh weights, no checkpoint).
+    model = instance_model(hp, ep)
 
     lit_module = PascalLitModule(
         model=model,
-        backbone_lr=backbone_lr,
-        router_lr=router_lr,
-        head_lr=head_lr,
-        weight_decay=weight_decay,
-        num_classes=num_classes,
-        train_epochs=train_epochs,
-        temp_init=temp_init,
-        temp_final=temp_final,
-        temp_epochs=temp_epochs,
+        hparams=hp,
+        loss_weights=lw,
+        epoch_params=ep,
+        static="learnable",
     )
 
     # Logger (same as Tiny_Training/main.py).
     logger = WandbLogger(
         project="PCE",
         log_model=False,
-        name="Test-Pascal-VOC2012-Segmentation",
+        name="Pascal-VOC2012-Segmentation - From Scratch",
     )
     logger.experiment.define_metric("epoch")
     logger.experiment.define_metric("*", step_metric="epoch")
@@ -246,14 +222,14 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        max_epochs=train_epochs,
+        max_epochs=ep.train_epochs,
         logger=logger,
         precision=precision,
         accelerator=device,
         enable_checkpointing=True,
         callbacks=[checkpoint_callback],
         num_sanity_val_steps=0,
-        accumulate_grad_batches=2,
+        accumulate_grad_batches=hp.accumulate_grad_batches,
     )
 
     print("--- Start training --- \n")
