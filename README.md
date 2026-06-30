@@ -37,5 +37,4 @@ Each experts is composed of :
 ## Pascal-VOC Test
 *Work in progress...*
 
-**To more details of the architecture and training :**
-*File work in progress...*
+**To more details of the architecture and training :** [Architecture and Training detail latex documentation]{docs/latex_docs/main.pdf}
