@@ -10,10 +10,10 @@ from torchmetrics import JaccardIndex
 from torchmetrics.classification import MulticlassAccuracy
 
 from Model.Components.DownsampleResBlock import DownsampleResBlock
-from train_utils import collect_model_prameters, collect_router_metrics, clip_gradients
+from train_utils import collect_model_prameters, collect_router_metrics, clip_gradients, compute_patch_class
 from schedulers import backbone_lr_lambda, router_lr_lambda, temp_scheduler, noise_scheduler
 
-from config import HParams, LossWeights, EpochParams
+from config import HParams, LossWeights, EpochParams, RouterTypesParams
 
 class PascalLitModule(pl.LightningModule):
     def __init__(
@@ -23,10 +23,11 @@ class PascalLitModule(pl.LightningModule):
         loss_weights: LossWeights,
         epoch_params: EpochParams,
         static: str = "learnable",
+        router_types: RouterTypesParams = None,
     ):
 
         super().__init__()
-        self.save_hyperparameters(ignore=['model'])
+        self.save_hyperparameters(ignore=['model', 'router_types'])
 
         self.model = model
         self.hp = hparams
@@ -35,6 +36,7 @@ class PascalLitModule(pl.LightningModule):
         # Controls whether the static map (pos_coeff) is trainable when unfrozen.
         assert static in ("learnable", "not_learnable")
         self.static = static
+        self.router_types = router_types
 
         self.backbone_lr = hparams.backbone_lr
         self.router_lr = hparams.router_lr
@@ -64,13 +66,10 @@ class PascalLitModule(pl.LightningModule):
         # Aux losses gated: off (0.0) during uniform-routing, set to LossWeights
         # from router_start_epoch onward (see on_train_epoch_start).
         self.z_loss_weigth = 0.0
-        self.spatial_loss_weight = 0.0
 
         # Training losses (on-device scalars, reduced once per epoch)
         self.train_seg_losses = []
         self.train_aux_losses = []
-        self.train_raw_spatial_losses = []
-        self.train_weighted_spatial_losses = []
         self.train_raw_z_losses = []
         self.train_weighted_z_losses = []
         self.train_total_losses = []
@@ -78,8 +77,6 @@ class PascalLitModule(pl.LightningModule):
         # Validation losses
         self.val_seg_losses = []
         self.val_aux_losses = []
-        self.val_raw_spatial_losses = []
-        self.val_weighted_spatial_losses = []
         self.val_raw_z_losses = []
         self.val_weighted_z_losses = []
         self.val_total_losses = []
@@ -89,6 +86,7 @@ class PascalLitModule(pl.LightningModule):
 
         # Per-pixel CE, ignore_index = VOC void/border (255)
         ignore_index = loss_weights.ignore_index
+        self.ignore_index = ignore_index
         label_smoothing = loss_weights.label_smoothing
         self.train_loss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index, label_smoothing=label_smoothing)
         self.val_loss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
@@ -100,8 +98,34 @@ class PascalLitModule(pl.LightningModule):
             "macc":   MulticlassAccuracy(num_classes=self.num_classes, ignore_index=ignore_index, average="macro"),
         })
 
-    def forward(self, x):
-        return self.model(x, current_epoch=self.current_epoch, collect_routes=True, collect_debug=False)
+    def setup(self, stage=None):
+        # Log the router-type selection (provenance) to the experiment config once the
+        # logger is attached. Flat primitive fields only, so W&B serialization is safe.
+        if self.router_types is not None and self.logger is not None:
+            try:
+                self.logger.log_hyperparams(
+                    {f"router_types/{k}": v for k, v in vars(self.router_types).items()}
+                )
+            except Exception:
+                pass
+
+    def forward(self, x, patch_class=None):
+        return self.model(
+            x,
+            current_epoch=self.current_epoch,
+            collect_routes=True,
+            collect_debug=False,
+            patch_class=patch_class,
+        )
+
+    def _patch_class(self, label):
+        """Per-patch dominant class [B, P] from the GT mask, for the MI(exp, class)
+        diagnostic. Uses the model's fixed patch grid and the CE ignore_index so the
+        definition matches Testing/experiments/exp_num/mi_pos_class.py."""
+        grid_h, grid_w = self.model.patch_grid
+        return compute_patch_class(
+            label.long(), grid_h, grid_w, self.num_classes, self.ignore_index
+        )
 
     @staticmethod
     def _mean_tensor(values):
@@ -115,19 +139,16 @@ class PascalLitModule(pl.LightningModule):
         data, label = data.to(self.device), label.to(self.device)
 
         # Forward: logits (B, C, H, W)
-        logits, spatial_loss, z_loss, _ = self(data)
+        logits, z_loss, _div, _ = self(data, patch_class=self._patch_class(label))
 
         seg_loss = self.train_loss(logits, label.long())
 
-        weighted_spatial_loss = spatial_loss * self.spatial_loss_weight
         weighted_z_loss = z_loss * self.z_loss_weigth
-        aux_loss = weighted_z_loss + weighted_spatial_loss
+        aux_loss = weighted_z_loss
         total_loss = seg_loss + aux_loss
 
         self.train_seg_losses.append(seg_loss.detach())
         self.train_aux_losses.append(aux_loss.detach())
-        self.train_raw_spatial_losses.append(spatial_loss.detach())
-        self.train_weighted_spatial_losses.append(weighted_spatial_loss.detach())
         self.train_raw_z_losses.append(z_loss.detach())
         self.train_weighted_z_losses.append(weighted_z_loss.detach())
         self.train_total_losses.append(total_loss.detach())
@@ -138,19 +159,16 @@ class PascalLitModule(pl.LightningModule):
         data, label = batch
         data, label = data.to(self.device), label.to(self.device)
 
-        logits, spatial_loss, z_loss, _ = self(data)
+        logits, z_loss, _div, _ = self(data, patch_class=self._patch_class(label))
 
         seg_loss = self.val_loss(logits, label.long())
 
-        weighted_spatial_loss = spatial_loss * self.spatial_loss_weight
         weighted_z_loss = z_loss * self.z_loss_weigth
-        aux_loss = weighted_z_loss + weighted_spatial_loss
+        aux_loss = weighted_z_loss
         total_loss = seg_loss + aux_loss
 
         self.val_seg_losses.append(seg_loss.detach())
         self.val_aux_losses.append(aux_loss.detach())
-        self.val_raw_spatial_losses.append(spatial_loss.detach())
-        self.val_weighted_spatial_losses.append(weighted_spatial_loss.detach())
         self.val_raw_z_losses.append(z_loss.detach())
         self.val_weighted_z_losses.append(weighted_z_loss.detach())
         self.val_total_losses.append(total_loss.detach())
@@ -171,11 +189,12 @@ class PascalLitModule(pl.LightningModule):
         e = self.current_epoch
         if e < self.uniform_epochs:
             self._freeze_router()
+            self._freeze_post_block()
 
         elif e >= self.router_start_epoch:
             self._unfreeze_router()
+            self._unfreeze_post_block()
             self.z_loss_weigth = self.lw.z_loss_weight
-            self.spatial_loss_weight = self.lw.spatial_loss_weight
 
             # Advance temp/noise schedules
             self.model.router.router_temp = temp_scheduler(
@@ -199,8 +218,6 @@ class PascalLitModule(pl.LightningModule):
         log_dict = {
             'training/seg_loss': self._mean_tensor(self.train_seg_losses),
             'training/aux_loss': self._mean_tensor(self.train_aux_losses),
-            'training/raw_spatial_loss': self._mean_tensor(self.train_raw_spatial_losses),
-            'training/weighted_spatial_loss': self._mean_tensor(self.train_weighted_spatial_losses),
             'training/raw_z_loss': self._mean_tensor(self.train_raw_z_losses),
             'training/weighted_z_loss': self._mean_tensor(self.train_weighted_z_losses),
             'training/total_loss': self._mean_tensor(self.train_total_losses),
@@ -212,8 +229,6 @@ class PascalLitModule(pl.LightningModule):
 
         self.train_seg_losses.clear()
         self.train_aux_losses.clear()
-        self.train_raw_spatial_losses.clear()
-        self.train_weighted_spatial_losses.clear()
         self.train_raw_z_losses.clear()
         self.train_weighted_z_losses.clear()
         self.train_total_losses.clear()
@@ -236,8 +251,6 @@ class PascalLitModule(pl.LightningModule):
         log_dict = {
             'validation/seg_loss': self._mean_tensor(self.val_seg_losses),
             'validation/aux_loss': self._mean_tensor(self.val_aux_losses),
-            'validation/raw_spatial_loss': self._mean_tensor(self.val_raw_spatial_losses),
-            'validation/weighted_spatial_loss': self._mean_tensor(self.val_weighted_spatial_losses),
             'validation/raw_z_loss': self._mean_tensor(self.val_raw_z_losses),
             'validation/weighted_z_loss': self._mean_tensor(self.val_weighted_z_losses),
             'validation/total_loss': self._mean_tensor(self.val_total_losses),
@@ -248,8 +261,6 @@ class PascalLitModule(pl.LightningModule):
 
         self.val_seg_losses.clear()
         self.val_aux_losses.clear()
-        self.val_raw_spatial_losses.clear()
-        self.val_weighted_spatial_losses.clear()
         self.val_raw_z_losses.clear()
         self.val_weighted_z_losses.clear()
         self.val_total_losses.clear()
@@ -259,26 +270,29 @@ class PascalLitModule(pl.LightningModule):
         self.log_dict(log_dict, prog_bar=True, logger=True, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
-        # 3 groups: backbone (pretrained), head (from scratch), router (from scratch).
-        self.backbone_params, self.router_params, self.head_params = collect_model_prameters(
-            self.model, collect_head=True
+        # 4 groups: backbone (pretrained), head (from scratch), router (from scratch), post_block.
+        self.backbone_params, self.router_params, self.head_params, self.post_block_params = collect_model_prameters(
+            self.model, collect_head=True, collect_post_block=True
         )
 
         # Head follows the backbone schedule but with its own warmup (head_warmup)
-        backbone_fn = lambda e: backbone_lr_lambda(e, self.warmup_backbone, self.train_epochs)
-        head_fn     = lambda e: backbone_lr_lambda(e, self.head_warmup, self.train_epochs)
-        router_fn   = lambda e: router_lr_lambda(e, self.router_start_epoch, self.router_warmup, self.train_epochs)
+        backbone_fn   = lambda e: backbone_lr_lambda(e, self.warmup_backbone, self.train_epochs)
+        head_fn       = lambda e: backbone_lr_lambda(e, self.head_warmup, self.train_epochs)
+        router_fn     = lambda e: router_lr_lambda(e, self.router_start_epoch, self.router_warmup, self.train_epochs)
+        # post_block follows the backbone schedule; its base lr is already 0.1 * backbone_lr.
+        post_block_fn = lambda e: backbone_lr_lambda(e, self.warmup_backbone, self.train_epochs)
 
         # Group order == lr_lambda order passed to LambdaLR.
         self.optimizer = AdamW(
             [
-                {'params': self.backbone_params, 'lr': self.backbone_lr, 'weight_decay': self.weight_decay, 'name': 'backbone'},
-                {'params': self.head_params,     'lr': self.head_lr,     'weight_decay': self.weight_decay, 'name': 'head'},
-                {'params': self.router_params,   'lr': self.router_lr,   'weight_decay': 0.0,               'name': 'router'},
+                {'params': self.backbone_params,   'lr': self.backbone_lr,       'weight_decay': self.weight_decay, 'name': 'backbone'},
+                {'params': self.head_params,       'lr': self.head_lr,           'weight_decay': self.weight_decay, 'name': 'head'},
+                {'params': self.router_params,     'lr': self.router_lr,         'weight_decay': 0.0,               'name': 'router'},
+                {'params': self.post_block_params, 'lr': 0.1 * self.backbone_lr, 'weight_decay': self.weight_decay, 'name': 'post_block'},
             ], betas=self.hp.adam_betas, eps=self.hp.adam_eps
         )
 
-        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[backbone_fn, head_fn, router_fn])
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[backbone_fn, head_fn, router_fn, post_block_fn])
 
         return [self.optimizer], [self.lr_scheduler]
 
@@ -288,6 +302,7 @@ class PascalLitModule(pl.LightningModule):
             backbone_params=self.backbone_params,
             router_params=self.router_params,
             head_params=self.head_params,
+            post_block_params=self.post_block_params,
             backbone_max_norm=self.backbone_max_norm,
             router_max_norm=self.router_max_norm,
             head_max_norm=self.head_max_norm,
@@ -313,3 +328,13 @@ class PascalLitModule(pl.LightningModule):
 
         for p in self.model.router.parameters():
             p.requires_grad_(True)
+
+    def _freeze_post_block(self):
+        for n, p in self.model.named_parameters():
+            if 'post_block' in n:
+                p.requires_grad_(False)
+
+    def _unfreeze_post_block(self):
+        for n, p in self.model.named_parameters():
+            if 'post_block' in n:
+                p.requires_grad_(True)

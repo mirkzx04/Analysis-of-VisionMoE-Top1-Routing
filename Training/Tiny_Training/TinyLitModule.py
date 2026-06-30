@@ -21,7 +21,7 @@ from Model.Components.DownsampleResBlock import DownsampleResBlock
 from schedulers import temp_scheduler, noise_scheduler, backbone_lr_lambda, router_lr_lambda
 from train_utils import collect_model_prameters, collect_router_metrics, clip_gradients
 
-from config import HParams, LossWeights, AugParams, EpochParams
+from config import HParams, LossWeights, AugParams, EpochParams, RouterTypesParams
 
 class TinyLitModule(pl.LightningModule):
     def __init__(
@@ -33,6 +33,7 @@ class TinyLitModule(pl.LightningModule):
                 epoch_params: EpochParams,
                 device,
                 static: str = "learnable",
+                router_types: RouterTypesParams = None,
             ):
 
         """
@@ -61,6 +62,7 @@ class TinyLitModule(pl.LightningModule):
         # Controls whether the static map (pos_coeff) is trainable when unfrozen.
         assert static in ("learnable", "not_learnable")
         self.static = static
+        self.router_types = router_types
 
         self.lr = hparams.backbone_lr
         self.router_lr = hparams.router_lr
@@ -89,8 +91,6 @@ class TinyLitModule(pl.LightningModule):
         # Training losses
         self.train_class_losses = []
         self.train_aux_losses = []
-        self.train_raw_spatial_losses = []
-        self.train_weighted_spatial_losses = []
         self.train_raw_z_losses = []
         self.train_weighted_z_losses = []
         self.train_total_losses = []
@@ -98,8 +98,6 @@ class TinyLitModule(pl.LightningModule):
         # Validation losses
         self.val_class_losses = []
         self.val_aux_losses = []
-        self.val_raw_spatial_losses = []
-        self.val_weighted_spatial_losses = []
         self.val_raw_z_losses = []
         self.val_weighted_z_losses = []
         self.val_total_losses = []
@@ -120,7 +118,6 @@ class TinyLitModule(pl.LightningModule):
 
         # Aux losses gated off until router_start (set to active values in on_train_epoch_start)
         self.z_loss_weigth = 0.0
-        self.spatial_loss_weight = 0.0
 
         # Accuracy metrics
         self.accuracy_metrics = {
@@ -134,6 +131,16 @@ class TinyLitModule(pl.LightningModule):
         self.val_loss = torch.nn.CrossEntropyLoss()
         self.train_loss = torch.nn.CrossEntropyLoss(label_smoothing=loss_weights.label_smoothing) # M
 
+    def setup(self, stage=None):
+        # Log the router-type selection (provenance) to the experiment config once the
+        # logger is attached. Flat primitive fields only, so W&B serialization is safe.
+        if self.router_types is not None and self.logger is not None:
+            try:
+                self.logger.log_hyperparams(
+                    {f"router_types/{k}": v for k, v in vars(self.router_types).items()}
+                )
+            except Exception:
+                pass
 
     def forward(self, x, force_specialized = False, class_labels = None):
         """
@@ -176,7 +183,7 @@ class TinyLitModule(pl.LightningModule):
                 # Mixup
                 data, targets_a, targets_b, lam = self._mixup_batch(data, labels)
 
-            logits, spatial_loss, z_loss, _  = self(data)
+            logits, z_loss, _div, _  = self(data)
 
             # Loss = lam * CE(logits, y_a) + (1-lam) * CE(logits, y_b)
             class_loss = (
@@ -185,19 +192,16 @@ class TinyLitModule(pl.LightningModule):
             )
 
         else:
-            logits, spatial_loss, z_loss, _ = self(data, class_labels=labels)
+            logits, z_loss, _div, _ = self(data, class_labels=labels)
             class_loss = self.train_loss(logits, labels)
 
-        weighted_spatial_loss = spatial_loss * self.spatial_loss_weight
         weighted_z_loss = z_loss * self.z_loss_weigth
-        aux_loss = weighted_z_loss + weighted_spatial_loss
+        aux_loss = weighted_z_loss
         total_loss = class_loss + aux_loss
 
         # Detached on-device scalars, reduced once per epoch (avoids per-step GPU->CPU sync)
         self.train_class_losses.append(class_loss.detach())
         self.train_aux_losses.append(aux_loss.detach())
-        self.train_raw_spatial_losses.append(spatial_loss.detach())
-        self.train_weighted_spatial_losses.append(weighted_spatial_loss.detach())
         self.train_raw_z_losses.append(z_loss.detach())
         self.train_weighted_z_losses.append(weighted_z_loss.detach())
 
@@ -224,6 +228,7 @@ class TinyLitModule(pl.LightningModule):
         clip_gradients(
             backbone_params=self.backbone_params,
             router_params=self.router_params,
+            post_block_params=self.post_block_params,
             backbone_max_norm=self.backbone_max_norm,
             router_max_norm=self.router_max_norm,
         )
@@ -242,7 +247,6 @@ class TinyLitModule(pl.LightningModule):
         elif e >= self.router_start_epoch:
             self._unfreeze_router()
             self.z_loss_weigth = self.lw.z_loss_weight
-            self.spatial_loss_weight = self.lw.spatial_loss_weight
 
             self.model.router.router_temp = temp_scheduler(
                 current_epoch=self.current_epoch, 
@@ -284,8 +288,6 @@ class TinyLitModule(pl.LightningModule):
         log_dict = {
             'training/train_class_loss' : self._mean_tensor(self.train_class_losses),
             'training/train_aux_loss' : self._mean_tensor(self.train_aux_losses),
-            'training/raw_spatial_loss' : self._mean_tensor(self.train_raw_spatial_losses),
-            'training/weighted_spatial_loss' : self._mean_tensor(self.train_weighted_spatial_losses),
             'training/raw_z_loss' : self._mean_tensor(self.train_raw_z_losses),
             'training/weighted_z_loss' : self._mean_tensor(self.train_weighted_z_losses),
             'training/train_total_loss' : self._mean_tensor(self.train_total_losses),
@@ -301,8 +303,6 @@ class TinyLitModule(pl.LightningModule):
 
         self.train_class_losses.clear()
         self.train_aux_losses.clear()
-        self.train_raw_spatial_losses.clear()
-        self.train_weighted_spatial_losses.clear()
         self.train_raw_z_losses.clear()
         self.train_weighted_z_losses.clear()
         self.train_total_losses.clear()
@@ -330,20 +330,17 @@ class TinyLitModule(pl.LightningModule):
         data, labels = batch
         data, labels = data.to(self.device), labels.to(self.device)
 
-        logits, spatial_loss, z_loss, _ = self(data, class_labels=labels)
+        logits, z_loss, _div, _ = self(data, class_labels=labels)
 
         class_loss = self.val_loss(logits, labels)
 
-        weighted_spatial_loss = spatial_loss * self.spatial_loss_weight
         weighted_z_loss = z_loss * self.z_loss_weigth
-        aux_loss = (weighted_z_loss + weighted_spatial_loss)
+        aux_loss = weighted_z_loss
         total_loss = class_loss + aux_loss
 
         # Detached on-device scalars, reduced once per epoch (avoids per-step GPU->CPU sync)
         self.val_class_losses.append(class_loss.detach())
         self.val_aux_losses.append(aux_loss.detach())
-        self.val_raw_spatial_losses.append(spatial_loss.detach())
-        self.val_weighted_spatial_losses.append(weighted_spatial_loss.detach())
         self.val_raw_z_losses.append(z_loss.detach())
         self.val_weighted_z_losses.append(weighted_z_loss.detach())
         self.val_total_losses.append(total_loss.detach())
@@ -372,8 +369,6 @@ class TinyLitModule(pl.LightningModule):
         log_dict = {
             'validation/val_class_loss' : self._mean_tensor(self.val_class_losses),
             'validation/val_aux_loss' : self._mean_tensor(self.val_aux_losses),
-            'validation/raw_spatial_loss' : self._mean_tensor(self.val_raw_spatial_losses),
-            'validation/weighted_spatial_loss' : self._mean_tensor(self.val_weighted_spatial_losses),
             'validation/raw_z_loss' : self._mean_tensor(self.val_raw_z_losses),
             'validation/weighted_z_loss' : self._mean_tensor(self.val_weighted_z_losses),
             'validation/val_total_loss' : self._mean_tensor(self.val_total_losses),
@@ -383,8 +378,6 @@ class TinyLitModule(pl.LightningModule):
 
         self.val_class_losses.clear()
         self.val_aux_losses.clear()
-        self.val_raw_spatial_losses.clear()
-        self.val_weighted_spatial_losses.clear()
         self.val_raw_z_losses.clear()
         self.val_weighted_z_losses.clear()
         self.val_total_losses.clear()
@@ -395,20 +388,25 @@ class TinyLitModule(pl.LightningModule):
 
     def configure_optimizers(self):
 
-        self.backbone_params, self.router_params = collect_model_prameters(self.model)
+        self.backbone_params, self.router_params, self.post_block_params = collect_model_prameters(
+            self.model, collect_post_block=True
+        )
 
         # LambdaLR vuole callable(epoch); chiudiamo le fn di schedulers.py sui soli `epoch`
         backbone_fn = lambda e: backbone_lr_lambda(e, self.warmup_backbone, self.train_epochs)
         router_fn = lambda e: router_lr_lambda(e, self.router_start_epoch, self.router_warmup, self.train_epochs)
+        # post_block segue lo schedule del backbone; la sua lr base è già 0.1 * lr backbone.
+        post_block_fn = lambda e: backbone_lr_lambda(e, self.warmup_backbone, self.train_epochs)
 
         self.optimizer = AdamW(
             [
                 {'params': self.backbone_params, 'lr': self.lr, 'weight_decay': self.weight_decay, 'name': 'backbone'},
                 {'params': self.router_params, 'lr': self.router_lr, 'weight_decay': 0.0, 'name': 'router'},
+                {'params': self.post_block_params, 'lr': 0.1 * self.lr, 'weight_decay': self.weight_decay, 'name': 'post_block'},
             ], betas=self.hp.adam_betas, eps=self.hp.adam_eps
         )
 
-        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[backbone_fn, router_fn])
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=[backbone_fn, router_fn, post_block_fn])
 
         return [self.optimizer], [self.lr_scheduler]
 
@@ -432,6 +430,16 @@ class TinyLitModule(pl.LightningModule):
 
         for p in self.model.router.parameters():
             p.requires_grad_(True)
+
+    def _freeze_post_block(self):
+        for n, p in self.model.named_parameters():
+            if 'post_block' in n:
+                p.requires_grad_(False)
+
+    def _unfreeze_post_block(self):
+        for n, p in self.model.named_parameters():
+            if 'post_block' in n:
+                p.requires_grad_(True)
 
     # MIXUP - CutMix utils
     def _sample_lambda(self, alpha) :

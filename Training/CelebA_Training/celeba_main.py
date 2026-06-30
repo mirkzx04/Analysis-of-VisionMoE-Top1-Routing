@@ -22,7 +22,26 @@ from pytorch_lightning.loggers import WandbLogger
 from Model.PCE import PCENetwork
 from Datasets_Classes.CelebAMaskHQ import build_celeba_datasets
 from CelebA_Training.CelebaLitModule import CelebaLitModule
-from config import HParams, LossWeights, EpochParams
+from config import HParams, RouterTypesParams, LossWeights, EpochParams
+
+
+class PeriodicEpochCheckpoint(pl.Callback):
+    """Save a FULL checkpoint (weights + optimizer state) every `every` epochs into
+    ``<base_dir>/checkpoints_{epoch}/checkpoint.ckpt`` (1-based epoch count), for the
+    DIAGNOSTIC TEST 2 per-epoch suite. Does not overwrite Lightning's best/last."""
+    def __init__(self, every=5, base_dir="checkpoints_celeba"):
+        super().__init__()
+        self.every = every
+        self.base_dir = base_dir
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        e = trainer.current_epoch + 1          # epochs completed so far
+        if e % self.every == 0:
+            d = os.path.join(self.base_dir, f"checkpoints_{e}")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, "checkpoint.ckpt")
+            trainer.save_checkpoint(path)
+            print(f"[periodic-ckpt] epoch {e}: saved {path}", flush=True)
 
 
 def get_accelerator_and_precision():
@@ -47,7 +66,7 @@ def get_accelerator_and_precision():
     return "cuda", "32-true"
 
 
-def instance_model(hp: HParams, ep: EpochParams):
+def instance_model(hp: HParams, rt: RouterTypesParams, ep: EpochParams):
     """Instantiate PCENetwork FROM SCRATCH (fresh random weights, NO checkpoint)."""
     pce = PCENetwork(
         num_experts=hp.num_experts,
@@ -59,8 +78,13 @@ def instance_model(hp: HParams, ep: EpochParams):
         capacity_factor_val=hp.capacity_factor_val,
         halo_for_patches=hp.halo_for_patches,
         input_size=hp.input_size,
-        use_static_map=hp.use_static_map,
-        unified_router=hp.unified_router,
+        use_static_map=rt.use_static_map,
+        pos_only=rt.pos_only,
+        semantic_only=rt.semantic_only,
+        unified_router=rt.unified_router,
+        interaction=rt.interaction,
+        interaction_hidden_size=rt.interaction_hidden_size,
+        interaction_include_main_effects=rt.interaction_include_main_effects,
         task="seg",
         uniform_epochs=ep.uniform_epochs,
     )
@@ -83,8 +107,6 @@ if __name__ == "__main__":
         input_size=224,
         capacity_factor_train=2.0,
         capacity_factor_val=2.0,
-        use_static_map=False,
-        unified_router=False,
         task="seg",
         num_classes=19,
         batch_size=64,
@@ -102,6 +124,15 @@ if __name__ == "__main__":
         router_max_norm=0.5,
         head_max_norm=1.0,
     )
+    rt = RouterTypesParams(
+        use_static_map=False,
+        pos_only=False,
+        semantic_only=False,
+        interaction=True, 
+        unified_router=False,
+        interaction_hidden_size=128,
+        interaction_include_main_effects=True,
+    )
     # Epoch counts / warmups (schedule durations).
     ep = EpochParams(
         train_epochs=100,
@@ -109,13 +140,13 @@ if __name__ == "__main__":
         warmup_backbone=5,
         head_warmup=5,
         router_warmup=5,
-        temp_epochs=10,
+        temp_epochs=20,
     )
 
     loss_weights = LossWeights(
         z_loss_weight=1e-2,
-        spatial_loss_weight=1e-4,
         label_smoothing=0.0,
+        diversity_loss_weight=0.05,
         ignore_index=255,
     )
 
@@ -133,7 +164,7 @@ if __name__ == "__main__":
     print(f"--- Dataset loaded: {len(train_set)} train / {len(val_set)} val --- \n")
 
     # Model: FROM SCRATCH (fresh random weights, NO checkpoint).
-    model = instance_model(hparams, ep)
+    model = instance_model(hparams, rt, ep)
 
     lit_module = CelebaLitModule(
         model=model,
@@ -141,13 +172,14 @@ if __name__ == "__main__":
         loss_weights=loss_weights,
         epoch_params=ep,
         static="learnable",
+        router_types=rt,
     )
 
     # Logger (same style as the other trainings).
     logger = WandbLogger(
         project="PCE",
         log_model=False,
-        name="CelebAMask-HQ Face Parsing - From Scratch - Pos. Only",
+        name="CelebAMask-HQ Face Parsing - From Scratch - Interaction_B",
     )
     logger.experiment.define_metric("epoch")
     logger.experiment.define_metric("*", step_metric="epoch")
@@ -167,7 +199,7 @@ if __name__ == "__main__":
         precision=precision,
         accelerator=device,
         enable_checkpointing=True,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, PeriodicEpochCheckpoint(every=5, base_dir="checkpoints_celeba")],
         num_sanity_val_steps=0,
         accumulate_grad_batches=hparams.accumulate_grad_batches,
     )

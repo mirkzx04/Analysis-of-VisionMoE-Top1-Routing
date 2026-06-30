@@ -33,7 +33,7 @@ from Model.PCE import PCENetwork
 # from Datasets_Classes.PatchExtractor import PatchExtractor
 
 from Tiny_Training.TinyLitModule import TinyLitModule
-from config import HParams, LossWeights, AugParams, EpochParams
+from config import HParams, RouterTypesParams, LossWeights, AugParams, EpochParams
 
 def count_number_of_classes(train_labels, val_labels):
     return len(np.unique(np.concatenate([train_labels, val_labels])).tolist())
@@ -119,8 +119,6 @@ if __name__ == "__main__":
         input_size=224,
         capacity_factor_train=2.00,
         capacity_factor_val=2.00,
-        use_static_map=False,
-        unified_router=False,
         task="class",
         # optim / train
         batch_size=64,
@@ -136,6 +134,15 @@ if __name__ == "__main__":
         # clipping (Tiny has no head group)
         backbone_max_norm=1.5,
         router_max_norm=0.5,
+    )
+    rt = RouterTypesParams(
+        use_static_map=False,
+        pos_only=False,
+        semantic_only=False,
+        interaction=False,
+        unified_router=False,
+        interaction_hidden_size=128,
+        interaction_include_main_effects=False,
     )
     # Epoch counts / warmups (schedule durations).
     ep = EpochParams(
@@ -156,7 +163,6 @@ if __name__ == "__main__":
     # before then inside the lit module). label_smoothing=0.10 for the train CE.
     lw = LossWeights(
         z_loss_weight=1e-2,
-        spatial_loss_weight=1e-3,
         label_smoothing=0.10,
     )
 
@@ -199,15 +205,20 @@ if __name__ == "__main__":
         capacity_factor_val = hp.capacity_factor_val,
         halo_for_patches=hp.halo_for_patches,
         input_size=hp.input_size,
-        use_static_map=hp.use_static_map,
-        unified_router = hp.unified_router,
+        use_static_map=rt.use_static_map,
+        pos_only=rt.pos_only,
+        semantic_only=rt.semantic_only,
+        unified_router=rt.unified_router,
+        interaction=rt.interaction,
+        interaction_hidden_size=rt.interaction_hidden_size,
+        interaction_include_main_effects=rt.interaction_include_main_effects,
         uniform_epochs=ep.uniform_epochs,
         task=hp.task,
         )
     # pce = torch.compile(pce, mode="reduce-overhead")
 
     lit_module = TinyLitModule(
-        pce=pce, hparams=hp, loss_weights=lw, aug_params=aug, epoch_params=ep, device=device, static="learnable",
+        pce=pce, hparams=hp, loss_weights=lw, aug_params=aug, epoch_params=ep, device=device, static="learnable", router_types=rt,
     )
     trainer = pl.Trainer(
         max_epochs=ep.train_epochs,

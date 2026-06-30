@@ -24,7 +24,7 @@ class Router(nn.Module):
         router_temp = 1.5,
         capacity_factor_train = 1.25,
         capacity_factor_eval = 1.50,
-        sem_weight_temp = 1.0,
+        sem_weight_temp = 5.0,
         uniform_epochs = 0,
         ):
         super().__init__()
@@ -89,146 +89,45 @@ class Router(nn.Module):
         unified_router = bool(unified_router or getattr(router_gate, "unified_router", False))
 
         # Always compute logits for monitoring and potential use.
-        # RouterGate returns separated semantic/positional logits only when the
-        # positional branch exists independently; unified/static gates return
-        # already-combined logits.
         gate_out = router_gate(X, positional_features)
-        spatial_loss = X.new_tensor(0.0, dtype=torch.float32)
         logit_stats = {
             "logits_std": None,
             "logits_temp_std": None,
-            "logits_std_pos": None,
-            "logits_std_sem": None,
-            "logits_temp_std_pos": None,
-            "logits_temp_std_sem": None,
         }
 
-        if isinstance(gate_out, tuple):
-            sem_logits, pos_logits = gate_out
-            sem_logits, pos_logits = sem_logits.float(), pos_logits.float()
+    
+        logits_router = gate_out.to(dtype=torch.float32)
+        z_loss = self.z_loss(logits_router)
+        # Diversity loss: per-position expert decorrelation, computed in the forward in the
+        # same style as z_loss and threaded through every routing branch. It is accumulated
+        # across MoE layers in PCENetwork.forward (tot_div_loss), then weighted in the
+        # LitModule. Uses the routing probs softmax(logits / router_temp).
+        div_loss = self.diversity_loss_from_logits(logits_router, num_positions, N)
+        if collect_metrics:
+            logit_stats.update({
+                "logits_std": logits_router.detach().std(),
+                "logits_temp_std": (logits_router / self.router_temp).detach().std(),
+            })
+            if getattr(router_gate, "is_static_map", False):
+                logit_stats["logits_std_pos"] = logit_stats["logits_std"]
+                logit_stats["logits_temp_std_pos"] = logit_stats["logits_temp_std"]
 
-            # Selection by position; semantics weights the chosen expert's output
-            # downstream in _specialized_routing.
-            weighting_logits = sem_logits
-            selection_logits = pos_logits
+        # Route based on current phase (Uniform < uniform_epochs, then specialized).
+        if current_epoch is not None and current_epoch < self.uniform_epochs:
+            return self._uniform_routing(X, logits_router, logit_stats, z_loss, div_loss)
 
-            logits_router = (selection_logits, weighting_logits)
-            if ( self.training and not getattr(router_gate, "is_static_map", False) and not unified_router and h_patches is not None and w_patches is not None):
-                spatial_loss = self.spatial_loss(selection_logits, h_patches, w_patches)
-            z_loss = self.z_loss(weighting_logits)
+        # Deterministic fixed position->expert map: activates AFTER the uniform phase
+        if getattr(router_gate, "is_deterministic_map", False):
+            routing_state = router_gate.build_routing_state(N, X.device)
+            return routing_state, z_loss, div_loss, logits_router.detach(), logit_stats
 
-            if collect_metrics:
-                logit_stats.update({
-                    "logits_std_pos": pos_logits.detach().std(),
-                    "logits_std_sem": sem_logits.detach().std(),
-                    "logits_temp_std_pos": (pos_logits / self.router_temp).detach().std(),
-                    "logits_temp_std_sem": (sem_logits / self.router_temp).detach().std(),
-                })
-        else:
-            logits_router = gate_out.to(dtype=torch.float32)
-            z_loss = self.z_loss(logits_router)
-            # spatial_loss = self.spatial_loss(pos_logits, h_patches, w_patches)
-            if collect_metrics:
-                logit_stats.update({
-                    "logits_std": logits_router.detach().std(),
-                    "logits_temp_std": (logits_router / self.router_temp).detach().std(),
-                })
-                if getattr(router_gate, "is_static_map", False):
-                    logit_stats["logits_std_pos"] = logit_stats["logits_std"]
-                    logit_stats["logits_temp_std_pos"] = logit_stats["logits_temp_std"]
-
-        # Route based on current phase (Uniform < 30 epochs, Specialized >= 30 epochs)
         if current_epoch == None:
-            return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss, collect_metrics)
-        if current_epoch < self.uniform_epochs:
-            return self._uniform_routing(X, logits_router, logit_stats, z_loss, spatial_loss)
-        if getattr(router_gate, "is_static_map", False):
-            return self._static_expert_region_routing(X, logits_router, logit_stats, z_loss, spatial_loss, num_positions)
+            return self._specialized_routing(X, logits_router, logit_stats, z_loss, div_loss, collect_metrics)
         else:
-            return self._specialized_routing(X, logits_router, logit_stats, z_loss, spatial_loss, collect_metrics)
+            return self._specialized_routing(X, logits_router, logit_stats, z_loss, div_loss, collect_metrics)
 
-    def _static_expert_region_routing(
-        self,
-        X,
-        logits,
-        logit_stats,
-        z_loss,
-        spatial_loss,
-        num_positions,
-    ):
-        """
-        Static expert -> region routing.
-
-        X: [B*P, C, H, W]
-        logits: [B*P, E], prodotti da StaticMapGate, quindi dipendono solo dalla posizione
-        num_positions: P, numero di posizioni/patch per immagine
-        """
-
-        N = X.shape[0]
-        E = self.num_experts
-        P = int(num_positions)
-
-        if N % P != 0:
-            raise ValueError(f"N={N} must be divisible by num_positions={P}")
-
-        B = N // P
-
-        # [B*P, E] -> [B, P, E]
-        logits_bpe = logits.view(B, P, E)
-
-        # Siccome il gate è statico, ogni immagine dovrebbe avere la stessa mappa.
-        # Uso mean(0) invece di [0] per evitare dipendenze spurie dalla prima immagine.
-        logits_pos = logits_bpe.mean(dim=0)  # [P, E]
-
-        probs_pos = F.softmax(logits_pos.float() / self.router_temp, dim=-1)  # [P, E]
-
-        # Capacità per esperto in termini di posizioni per immagine
-        cap_factor = self.capacity_factor_train if self.training else self.capacity_factor_eval
-        k_pos = max(1, math.ceil(cap_factor * P / E))
-        k_pos = min(k_pos, P)
-
-        # Expert-choice statico:
-        # ogni esperto sceglie le sue k_pos posizioni preferite
-        topk_prob, topk_pos = torch.topk(
-            probs_pos,
-            k=k_pos,
-            dim=0,
-            largest=True,
-            sorted=True,
-        )  # [k_pos, E]
-
-        # Replica la stessa mappa per ogni immagine del batch
-        batch_offsets = torch.arange(B, device=X.device).view(B, 1, 1) * P
-        token_idx = (
-            topk_pos.view(1, k_pos, E)
-            .add(batch_offsets)
-            .permute(2, 0, 1)
-            .reshape(E, B * k_pos)
-        )
-
-        expert_idx = torch.arange(E, device=X.device).view(E, 1).expand(E, B * k_pos)
-        slot_idx = torch.arange(B * k_pos, device=X.device).view(1, B * k_pos).expand(E, B * k_pos)
-        weights = (
-            topk_prob.view(1, k_pos, E)
-            .expand(B, k_pos, E)
-            .permute(2, 0, 1)
-            .reshape(E, B * k_pos)
-            .float()
-        )
-
-        routing_state = RoutingState(
-            token_idx=token_idx.reshape(-1),
-            expert_idx=expert_idx.reshape(-1),
-            slot_idx=slot_idx.reshape(-1),
-            weights=weights.reshape(-1),
-            num_experts=E,
-            num_tokens=N,
-            capacity=B * k_pos,
-        )
-
-        return routing_state, spatial_loss, z_loss, logits.detach(), logit_stats
-
-    def _specialized_routing(self, X, logits, logit_stats, z_loss, spatial_loss, collect_metrics=False):
+    
+    def _specialized_routing(self, X, logits, logit_stats, z_loss, div_loss, collect_metrics=False):
         """
         Specialized top-1 routing (Phase 2/3).
 
@@ -240,15 +139,9 @@ class Router(nn.Module):
 
         # Adding noise in logits (only the selection branch when decoupled)
         if self.training and self.noise_std > 0:
-            if isinstance(logits, tuple):
-                logits = (logits[0] + torch.randn_like(logits[0]) * self.noise_std,) + tuple(logits[1:])
-            else:
-                logits = logits + torch.randn_like(logits.float()) * self.noise_std
+            logits = logits + torch.randn_like(logits.float()) * self.noise_std
 
-        if isinstance(logits, tuple) :
-            probs_e2t = F.softmax(logits[0] / self.router_temp, dim = -1)
-        else :
-            probs_e2t = F.softmax(logits.float() / self.router_temp, dim = -1) # [N, E]
+        probs_e2t = F.softmax(logits.float() / self.router_temp, dim = -1) # [N, E]
 
         # Calculate capacity per expert (must be an integer)
         cap_factor = self.capacity_factor_train if self.training else self.capacity_factor_eval
@@ -268,33 +161,7 @@ class Router(nn.Module):
         expert_idx = torch.arange(E, device=X.device).view(E, 1).expand(E, k)
         slot_idx = torch.arange(k, device=X.device).view(1, k).expand(E, k)
 
-        if isinstance(logits, tuple):
-            # --- Stage 2: semantic weighting renormalized over S(n) = {experts that selected token n} ---
-            sem_logits = logits[1]                                # [N, E]
-            sel_sem_logit = sem_logits.gather(0, topk_idx)
-            flat_tok = topk_idx.reshape(-1)
-
-            # Per-token max over S(n) for numerical stability (sem logits std is large/rising).
-            with torch.no_grad():
-                max_sem = torch.full(
-                    (N,), float("-inf"), device=X.device, dtype=sel_sem_logit.dtype
-                )
-                max_sem.scatter_reduce_(
-                    0, flat_tok, sel_sem_logit.reshape(-1), reduce="amax", include_self=True
-                )
-
-            num = torch.exp((sel_sem_logit - max_sem[topk_idx]) / self.sem_weight_temp)  # [k, E]
-            denom = torch.zeros(N, device=X.device, dtype=num.dtype).index_add(
-                0, flat_tok, num.reshape(-1)
-            )                                                     # denom[n] = sum_{e' in S(n)} exp(...)
-            w_sem = num / (denom[topk_idx] + 1e-9)                # [k, E] convex over S(n)
-
-            p_sel = F.softmax(logits[0] / self.router_temp, dim=-1).gather(0, topk_idx)  # [k, E]
-            p_sel_st = 1.0 + p_sel - p_sel.detach()
-
-            weights = (w_sem * p_sel_st).transpose(0, 1).contiguous().float()  # [E, k]
-        else:
-            weights = topk_prob.transpose(0, 1).contiguous().float()
+        weights = topk_prob.transpose(0, 1).contiguous().float()
         routing_state = RoutingState(
             token_idx=token_idx.reshape(-1),
             expert_idx=expert_idx.reshape(-1),
@@ -306,9 +173,9 @@ class Router(nn.Module):
         )
 
         logits_ret = logits[0] if isinstance(logits, tuple) else logits
-        return routing_state, spatial_loss, z_loss, logits_ret.detach(), logit_stats
+        return routing_state, z_loss, div_loss, logits_ret.detach(), logit_stats
 
-    def _uniform_routing(self, X, logits, logit_stats, z_loss, spatial_loss):
+    def _uniform_routing(self, X, logits, logit_stats, z_loss, div_loss):
         """
         Uniform routing (Phase 1).
 
@@ -355,10 +222,8 @@ class Router(nn.Module):
             capacity=ccap
         )
 
-        spatial_loss = X.new_tensor(0.0, dtype=torch.float32)
-
         logits_ret = logits[0] if isinstance(logits, tuple) else logits
-        return routing_state, spatial_loss, z_loss, logits_ret.detach(), logit_stats
+        return routing_state, z_loss, div_loss, logits_ret.detach(), logit_stats
 
     def z_loss(self, logits):
         """
@@ -370,42 +235,29 @@ class Router(nn.Module):
 
         return torch.logsumexp(logits, dim = -1).square().mean()
 
-    def spatial_loss(self, pos_logits, h_patches, w_patches):
-        """
-        Positional specialization loss (centroidi).
+    def diversity_loss_from_logits(self, logits, num_positions, N):
+        """Routing-prob diversity loss from raw logits. Returns a 0-d tensor.
+        Guards the [B, P, E] reshape: needs a valid num_positions dividing N."""
+        if not num_positions or num_positions <= 0 or (N % num_positions) != 0:
+            return logits.new_tensor(0.0)
+        probs = F.softmax(logits / self.router_temp, dim=-1)
+        return self.diversity_loss(probs, N // num_positions, num_positions)
 
-        Spinge gli expert su regioni spaziali separate: massimizza la distanza
-        media tra i centroidi (sulla griglia) delle distribuzioni posizione-per-expert.
+    def diversity_loss(self, probs, batch_szie, num_positions) :
+        E = probs.shape[-1]
+        if E <= 1 : 
+            return probs.new_tensor(0.0)
 
-        Args:
-            pos_logits (torch.Tensor): logit posizionali [B*P, E].
-            h_patches, w_patches (int): griglia delle posizioni per immagine.
-        """
-        N, E = pos_logits.shape
-        P = h_patches * w_patches
+        probs = probs.reshape(batch_szie, num_positions, E)
+        probs = probs.permute(1, 0, 2)
 
-        if P <= 1 or E <= 1 or N % P != 0:
-            return pos_logits.new_tensor(0.0)
+        probs_norm = F.normalize(probs, p = 2, dim = 1, eps = 1e-9)
+        corr = torch.einsum(
+            "pbe,pbf->pef",
+            probs_norm,
+            probs_norm,
+        )
 
-        B = N // P
-
-        # [B*P, E] -> [B, P, E] -> [P, E]
-        pos_map = pos_logits.view(B, P, E).mean(dim=0)
-
-        # distribuzione posizione-per-esperto
-        w = F.softmax(pos_map / self.router_temp, dim=0)  # [P, E]
-
-        device = pos_logits.device
-        rows = torch.arange(h_patches, device=device, dtype=torch.float32) / max(h_patches - 1, 1)
-        cols = torch.arange(w_patches, device=device, dtype=torch.float32) / max(w_patches - 1, 1)
-
-        grid_r = rows[:, None].expand(h_patches, w_patches).reshape(P)
-        grid_c = cols[None, :].expand(h_patches, w_patches).reshape(P)
-        pos_2d = torch.stack([grid_r, grid_c], dim=1)  # [P, 2]
-
-        centroids = w.transpose(0, 1) @ pos_2d  # [E, 2]
-
-        dists = torch.cdist(centroids, centroids, p=2.0)
-        off_diag = ~torch.eye(E, dtype=torch.bool, device=device)
-
-        return -dists[off_diag].mean()
+        eye = torch.eye(E, device=probs.device, dtype = probs.dtype).unsqueeze(0)
+        off_diagonal = corr * (1.0 - eye)
+        return (off_diagonal.square().sum(dim = (-2, -1)) / (E * (E - 1))).mean()

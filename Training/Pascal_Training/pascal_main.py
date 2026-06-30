@@ -26,7 +26,7 @@ from pytorch_lightning.loggers import WandbLogger
 
 from Model.PCE import PCENetwork
 from Pascal_Training.PascalLitModule import PascalLitModule
-from config import HParams, LossWeights, EpochParams
+from config import HParams, RouterTypesParams, LossWeights, EpochParams
 
 # Normalizzazione con statistiche ImageNet (standard).
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -94,7 +94,7 @@ def download_pascal_voc():
 
     return train_set, val_set
 
-def instance_model(hp: HParams, ep: EpochParams):
+def instance_model(hp: HParams, rt: RouterTypesParams, ep: EpochParams):
     pce = PCENetwork(
         num_experts = hp.num_experts,
         layer_number = hp.layer_number,
@@ -105,8 +105,13 @@ def instance_model(hp: HParams, ep: EpochParams):
         capacity_factor_val = hp.capacity_factor_val,
         halo_for_patches=hp.halo_for_patches,
         input_size=hp.input_size,
-        use_static_map=hp.use_static_map,
-        unified_router = hp.unified_router,
+        use_static_map=rt.use_static_map,
+        pos_only=rt.pos_only,
+        semantic_only=rt.semantic_only,
+        unified_router=rt.unified_router,
+        interaction=rt.interaction,
+        interaction_hidden_size=rt.interaction_hidden_size,
+        interaction_include_main_effects=rt.interaction_include_main_effects,
         task=hp.task,
         uniform_epochs=ep.uniform_epochs,
     )
@@ -151,8 +156,6 @@ if __name__ == "__main__":
         input_size=224,
         capacity_factor_train=2.00,
         capacity_factor_val=2.00,
-        use_static_map=False,
-        unified_router=False,
         task="seg",
         num_classes=21,            # VOC: 20 object classes + background
         # optim / train
@@ -160,54 +163,63 @@ if __name__ == "__main__":
         weight_decay=1e-2,         # match Tiny_Training/main.py
         backbone_lr=1e-3,          # from scratch
         head_lr=1e-3,              # segmentation head: trained from scratch
-        router_lr=1e-3,            # router: trained from scratch
+        router_lr=5e-4,            # router: trained from scratch
         accumulate_grad_batches=2,
         adam_betas=(0.9, 0.98),
         adam_eps=1e-8,
-        temp_init=1.75,
+        temp_init=1.5,             # allineato a CelebA (era 1.75)
         temp_final=0.50,
         # clipping
         backbone_max_norm=1.5,
         router_max_norm=0.5,
         head_max_norm=1.0,
     )
+    rt = RouterTypesParams(
+        use_static_map=False,
+        pos_only=False,
+        semantic_only=False,
+        interaction=True,
+        unified_router=False,
+        interaction_hidden_size=128,
+        interaction_include_main_effects=True,   # allineato a CelebA (era False)
+    )
     # Epoch counts / warmups (schedule durations).
     ep = EpochParams(
-        train_epochs=60,
-        uniform_epochs=0,
+        train_epochs=100,          # allineato a CelebA (era 60)
+        uniform_epochs=10,
         warmup_backbone=5,
-        head_warmup=10,
+        head_warmup=5,
         router_warmup=5,
-        temp_epochs=25,
+        temp_epochs=10,
     )
     lw = LossWeights(
-        z_loss_weight=1e-2,
-        spatial_loss_weight=1e-5,
+        z_loss_weight=1e-4,        # allineato a CelebA (era 1e-2)
         label_smoothing=0.0,
         ignore_index=VOC_IGNORE_INDEX,
     )
 
     # Data
     train_set, val_set = download_pascal_voc()
-    train_loader = DataLoader(train_set, batch_size=hp.batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_set, batch_size=hp.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_set, batch_size=hp.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=hp.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     # Model: from scratch (fresh weights, no checkpoint).
-    model = instance_model(hp, ep)
+    model = instance_model(hp, rt, ep)
 
     lit_module = PascalLitModule(
         model=model,
         hparams=hp,
         loss_weights=lw,
         epoch_params=ep,
-        static="learnable",
+        static="learnable",        # allineato a CelebA (era "not_learnable"; inerte con interaction gate)
+        router_types=rt,
     )
 
     # Logger (same as Tiny_Training/main.py).
     logger = WandbLogger(
         project="PCE",
         log_model=False,
-        name="Pascal-VOC2012-Segmentation - From Scratch",
+        name="Pascal-VOC2012-Segmentation - From Scratch-Interaction",
     )
     logger.experiment.define_metric("epoch")
     logger.experiment.define_metric("*", step_metric="epoch")

@@ -13,7 +13,8 @@ from Model.Components.DownsampleResBlock import DownsampleResBlock
 from Model.Components.MoEAggregator import MoEAggregator
 from Datasets_Classes.PatchExtractor import PatchExtractor
 from Model.Components.Router.Router import Router
-from Testing.dataclass.DebuggerDataClass import RoutingDebug
+# RoutingDebug disabilitato: il modulo Testing.dataclass.DebuggerDataClass è stato rimosso.
+# from Testing.dataclass.DebuggerDataClass import RoutingDebug
 
 class PCENetwork(nn.Module):
     def __init__(self,
@@ -27,7 +28,12 @@ class PCENetwork(nn.Module):
                     halo_for_patches,
                     input_size = 224,
                     use_static_map = False,
+                    pos_only = False,
+                    semantic_only = False,
                     unified_router = False,
+                    interaction = False,
+                    interaction_hidden_size = 128,
+                    interaction_include_main_effects = False,
                     task = "seg",
                     uniform_epochs = 0,
                  ):
@@ -53,7 +59,10 @@ class PCENetwork(nn.Module):
         self.halo_for_patches = halo_for_patches
         self.input_size = input_size
         self.use_static_map = use_static_map
+        self.pos_only = pos_only
+        self.semantic_only = semantic_only
         self.unified_router = unified_router
+        self.interaction = interaction
         self.task = task
 
         # Mixed-precision inference
@@ -67,7 +76,12 @@ class PCENetwork(nn.Module):
             layer_number=layer_number,
             input_size = input_size,
             use_static_map = use_static_map,
+            pos_only = pos_only,
+            semantic_only = semantic_only,
             unified_router = unified_router,
+            interaction = interaction,
+            interaction_hidden_size = interaction_hidden_size,
+            interaction_include_main_effects = interaction_include_main_effects,
         )
 
         self.router = Router(
@@ -111,7 +125,7 @@ class PCENetwork(nn.Module):
             num_layers=len(num_experts_per_layer),
             num_experts=num_experts_per_layer,
         )
-    def create_layers(self, num_experts, layer_number, input_size, use_static_map, unified_router):
+    def create_layers(self, num_experts, layer_number, input_size, use_static_map, pos_only, semantic_only, unified_router, interaction, interaction_hidden_size, interaction_include_main_effects):
         """
         Create layers of PCE Network
 
@@ -165,6 +179,12 @@ class PCENetwork(nn.Module):
                 w_position = current_w // patch_size
                 P = h_position * w_position
 
+                # Patch grid (constant 7x7 across PCE layers). Used to pool the
+                # GT segmentation mask into per-patch dominant classes for the
+                # MI(expert, class) metric (see Model.forward / MoEAggregator).
+                if getattr(self, "patch_grid", None) is None:
+                    self.patch_grid = (h_position, w_position)
+
                 self.layers.append(PCELayer(
                     inpt_channel=inpt_channel,
                     out_channel=out_channel,
@@ -176,7 +196,12 @@ class PCENetwork(nn.Module):
                     unfold_kernel_size = unfold_kernel_size,
                     num_positions = P,
                     use_static_map = use_static_map,
+                    pos_only = pos_only,
+                    semantic_only = semantic_only,
                     unified_router = unified_router,
+                    interaction = interaction,
+                    interaction_hidden_size = interaction_hidden_size,
+                    interaction_include_main_effects = interaction_include_main_effects,
                 ))
 
         return out_channel
@@ -187,7 +212,7 @@ class PCENetwork(nn.Module):
             return y
         return y[:, :, h:h + patch_size, h:h + patch_size]
 
-    def forward(self, X, current_epoch=None, collect_routes = False, collect_debug = None, class_labels = None):
+    def forward(self, X, current_epoch=None, collect_routes = False, collect_debug = None, class_labels = None, patch_class = None):
         """
         Forward method of PCE Network
 
@@ -212,17 +237,21 @@ class PCENetwork(nn.Module):
             logits (torch.tensor) : tensor beatches (B, num_classes)
         """
         tot_z_loss  = 0.0
-        tot_spatial_loss = 0.0
+        tot_div_loss = 0.0
 
         img_device = X.device
         B = X.shape[0]
         in_hw = X.shape[-2:]
+        # routing_debug resta sempre vuoto: la raccolta RoutingDebug è disabilitata.
+        # Mantenuto solo per preservare il contratto di ritorno (3 elementi quando
+        # collect_routes=True: i LitModule spacchettano `logits, z_loss, _`).
         routing_debug = []
 
-        # collect_debug controls only the (expensive) host-side routing dump used by
-        # offline analysis
-        if collect_debug is None:
-            collect_debug = collect_routes
+        # RoutingDebug disabilitato: collect_debug non viene più usato.
+        # # collect_debug controls only the (expensive) host-side routing dump used by
+        # # offline analysis
+        # if collect_debug is None:
+        #     collect_debug = collect_routes
 
         moe_layers = 0
 
@@ -245,10 +274,9 @@ class PCENetwork(nn.Module):
 
                 # Store layer attributes for cleaner access
                 experts = layer.experts
-                merge_gn = layer.merge_gn
-                merge_act = layer.activation_merge
                 post_block = layer.post_block
                 unfold_kernel_size = layer.unfold_kernel_size
+                alpha = layer.alpha
 
                 # Extract patches from the current feature map
                 patch_size = layer.patch_size
@@ -276,7 +304,7 @@ class PCENetwork(nn.Module):
 
                 # Route patches to experts and compute auxiliary losses.
                 with torch.autocast(device_type="cuda", enabled=False):
-                    routing_state, spatial_loss, z_loss, logits, logit_stats = self.router(
+                    routing_state, z_loss, div_loss, logits, logit_stats = self.router(
                         X_tokens.float(),
                         layer.router_gate,
                         positional_features.float(),
@@ -289,33 +317,41 @@ class PCENetwork(nn.Module):
 
                 if collect_routes:
                     valid_route = routing_state.weights > 0
-                    if collect_debug:
-                        with torch.no_grad():
-                            _gate_out = layer.router_gate(X_tokens.float(), positional_features.float())
-                            _sem_logits = _gate_out[0].detach().cpu() if isinstance(_gate_out, tuple) else None
-                            _patch_var = X_tokens.detach().float().var(dim=[1, 2, 3]).cpu()
-                        routing_debug.append(
-                            RoutingDebug(
-                                layer_idx=layer_idx,
-                                B = B,
-                                E = len(experts),
-                                h_patches=h_patches,
-                                w_patches=w_patches,
-                                token_idx=routing_state.token_idx[valid_route].detach().cpu(),
-                                experts_idx=routing_state.expert_idx[valid_route].detach().cpu(),
-                                weight = routing_state.weights[valid_route].detach().cpu(),
-                                logits = logits.detach().cpu(),
-                                sem_logits = _sem_logits,
-                                patch_var = _patch_var,
-                            )
-                        )
+                    # --- RoutingDebug disabilitato (Testing.dataclass.DebuggerDataClass rimosso) ---
+                    # if collect_debug:
+                    #     with torch.no_grad():
+                    #         _gate_out = layer.router_gate(X_tokens.float(), positional_features.float())
+                    #         _sem_logits = _gate_out[0].detach().cpu() if isinstance(_gate_out, tuple) else None
+                    #         _patch_var = X_tokens.detach().float().var(dim=[1, 2, 3]).cpu()
+                    #     routing_debug.append(
+                    #         RoutingDebug(
+                    #             layer_idx=layer_idx,
+                    #             B = B,
+                    #             E = len(experts),
+                    #             h_patches=h_patches,
+                    #             w_patches=w_patches,
+                    #             token_idx=routing_state.token_idx[valid_route].detach().cpu(),
+                    #             experts_idx=routing_state.expert_idx[valid_route].detach().cpu(),
+                    #             weight = routing_state.weights[valid_route].detach().cpu(),
+                    #             logits = logits.detach().cpu(),
+                    #             sem_logits = _sem_logits,
+                    #             patch_var = _patch_var,
+                    #         )
+                    #     )
 
                 E = int(routing_state.num_experts)
                 K = int(routing_state.capacity)
+                
                 dispatch_token_idx = routing_state.token_idx.view(E, K)
                 dispatch_weights = routing_state.weights.view(E, K).to(dtype=X_tokens.dtype)
+
                 X_center = self.crop_center(X_tokens, patch_size)
-                outputs = X_center.clone()
+                expert_outputs = torch.zeros_like(X_center)
+
+                token_mass = torch.zeros(N, device=X_tokens.device, dtype=X_tokens.dtype)
+                token_mass.index_add_(0, dispatch_token_idx.reshape(-1), dispatch_weights.reshape(-1))
+                processed_mask = token_mass > 0
+
                 rel_delta_sum = None
                 rel_delta_count = None
                 rel_delta_eps = 1e-8
@@ -330,8 +366,10 @@ class PCENetwork(nn.Module):
                     y_e = self.crop_center(y_e, patch_size)
 
                     delta_e = y_e - x_e_center
+                    y_e_scaled = x_e_center + delta_e
                     w_e = dispatch_weights[e].view(-1, 1, 1, 1)
-                    outputs.index_add_(0, n_e, (delta_e * w_e).to(dtype=outputs.dtype))
+                    
+                    expert_outputs.index_add_(0, n_e, (w_e * y_e_scaled).to(dtype=expert_outputs.dtype))
 
                     if collect_routes:
                         with torch.no_grad():
@@ -354,6 +392,12 @@ class PCENetwork(nn.Module):
                                 batch_rel_delta_count if rel_delta_count is None
                                 else rel_delta_count + batch_rel_delta_count
                             )
+                
+                output = torch.where(
+                    processed_mask.view(-1, 1, 1, 1),
+                    expert_outputs, 
+                    X_center,
+                )
 
                 # Reassemble patches back into spatial feature map
                 _, C_out, H_out, W_out = outputs.shape
@@ -386,7 +430,8 @@ class PCENetwork(nn.Module):
                             expert_effective_rel_delta_count=expert_effective_rel_delta_count,
                             num_positions=P,
                             class_labels=class_labels if self.task == "class" else None,
-                            num_classes=self.num_classes if self.task == "class" else None,
+                            num_classes=self.num_classes if self.task in ("class", "seg") else None,
+                            patch_class=patch_class if self.task == "seg" else None,
                         )
 
                 X = rearrange(
@@ -398,9 +443,8 @@ class PCENetwork(nn.Module):
 
                 # Dense and residual block
                 with amp_ctx():
-                    dens_in = merge_act(merge_gn(X))
-                    dense_delta = post_block(dens_in)
-                X = X + dense_delta
+                    dense_delta = post_block(X_sparse)
+                X = X_sparse + dense_delta
 
                 if collect_routes :
                     with torch.no_grad():
@@ -418,7 +462,7 @@ class PCENetwork(nn.Module):
                         )
 
                 tot_z_loss += z_loss
-                tot_spatial_loss += spatial_loss
+                tot_div_loss += div_loss
 
         # Apply global pooling and prediction head
         with amp_ctx():
@@ -433,12 +477,12 @@ class PCENetwork(nn.Module):
         logits = logits.float()
 
         tot_z_loss = tot_z_loss / moe_layers
-        tot_spatial_loss = tot_spatial_loss / moe_layers
+        tot_div_loss = tot_div_loss / moe_layers
 
         if collect_routes:
-            return logits, tot_spatial_loss, tot_z_loss, routing_debug
+            return logits, tot_z_loss, tot_div_loss, routing_debug
 
-        return logits, tot_spatial_loss, tot_z_loss
+        return logits, tot_z_loss, tot_div_loss
 
 
     def _indices_from_dispatch(self, dispatch):
